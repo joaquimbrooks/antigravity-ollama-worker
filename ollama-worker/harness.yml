@@ -1,0 +1,26 @@
+# ==============================================================================
+# MCP Harness Declarative Configuration for ollama-worker
+# ==============================================================================
+
+server:
+  name: "ollama-worker"
+  version: "0.1.0"
+  transport: "stdio"
+  log_level: "WARNING"
+  instructions: >-
+    Local Ollama coding delegation worker. Use list_local_ollama_models to
+    inspect installed models and delegate_coding_task with a self-contained
+    Radical Spec.
+
+middleware:
+  logging:
+    enabled: true
+    log_level: "WARNING"
+  metrics:
+    enabled: true
+  rate_limit:
+    enabled: false
+
+providers:
+  - name: "ollama-worker"
+    import_path: "provider:OllamaWorkerProvider"

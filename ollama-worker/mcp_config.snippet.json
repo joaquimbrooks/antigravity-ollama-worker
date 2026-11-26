@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ollama-worker": {
+      "command": "/path/to/antigravity-ollama-worker/ollama-worker/.venv/bin/python",
+      "args": [
+        "/path/to/antigravity-ollama-worker/ollama-worker/server.py"
+      ]
+    }
+  }
+}

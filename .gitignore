@@ -1,0 +1,22 @@
+# Python & Virtual Environments
+.venv/
+ollama-worker/.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Caches & Logs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
