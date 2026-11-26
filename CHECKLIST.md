@@ -4,7 +4,7 @@
 
 - **OS:** macOS, Linux, or Windows
 - **Python:** `>=3.10`
-- **Virtual Environment:** `<REPO_ROOT>/ollama-worker/.venv` (`google-antigravity`, `mcp-harness`, `pyyaml`)
+- **Virtual Environment:** `<REPO_ROOT>/ollama-worker/.venv` (`google-antigravity`, plus optional `mcp-harness` + `pyyaml`)
 - **Ollama:** Installed and reachable at `http://localhost:11434/api/tags` with at least one tool-capable local model
 
 ---
@@ -54,49 +54,36 @@ On **16 GB** unified-memory / VRAM machines (< 24 GB), configure a `32768` conte
 
 ---
 
-## 3. Registering `ollama-worker` in Antigravity
+## 3. Installing as a Global Antigravity Plugin (Recommended)
 
-- [ ] Generate your parameterized config snippet from the repository root:
+Use [install_plugin.sh](install_plugin.sh) so `.agents/` and `plugin/` stay the single source of truth in Git while generating concrete local paths in `~/.gemini/config/plugins/ollama-worker/`:
+
+- [ ] Run the idempotent plugin installer from the repository root:
+  ```zsh
+  ./install_plugin.sh
+  ```
+  This syncs `plugin/plugin.json`, `.agents/skills/radical-spec-delegate/SKILL.md`, `rules/AGENTS.md` (frontmatter stripped from `.agents/rules/quota-delegation.md`), and generates `mcp_config.json` from [mcp_config.snippet.json](ollama-worker/mcp_config.snippet.json).
+- [ ] In Antigravity IDE/App, open **Customizations** (or **MCP Servers** > **Refresh**; in `agy` CLI run `/mcp`) and confirm `ollama-worker` is enabled and exposes `list_local_ollama_models`, `delegate_coding_task`, resource `ollama://models`, and prompt `radical_spec`.
+
+### Alternative: Standalone `mcp_config.json` or Optional `mcp-harness` CLI
+
+- [ ] *(Standalone `mcp_config.json`)* Preview resolved JSON with:
   ```zsh
   sed "s|/path/to/antigravity-ollama-worker|$PWD|g" ollama-worker/mcp_config.snippet.json
   ```
-- [ ] Merge the `"ollama-worker"` entry from [mcp_config.snippet.json](ollama-worker/mcp_config.snippet.json) (with `/path/to/antigravity-ollama-worker` replaced by your local repo path) into your Antigravity MCP config (`~/.gemini/config/mcp_config.json` on macOS/Linux, `%USERPROFILE%\.gemini\config\mcp_config.json` on Windows, or `.agents/mcp_config.json` for a single workspace):
-  ```json
-  {
-    "mcpServers": {
-      "ollama-worker": {
-        "command": "/path/to/antigravity-ollama-worker/ollama-worker/.venv/bin/python",
-        "args": [
-          "/path/to/antigravity-ollama-worker/ollama-worker/server.py"
-        ]
-      }
-    }
-  }
-  ```
-- [ ] *(Optional — `mcp-harness` CLI / YAML mode)* Launch `OllamaWorkerProvider` via `mcp-harness` directly (or compose it with other `mcp-harness` providers in [harness.yml](ollama-worker/harness.yml)):
+  Merge into `~/.gemini/config/mcp_config.json` (macOS/Linux), `%USERPROFILE%\.gemini\config\mcp_config.json` (Windows), or `.agents/mcp_config.json` (workspace-only).
+- [ ] *(Optional — if you bring your own `mcp-harness` package)* Launch `OllamaWorkerProvider` directly via [harness.yml](ollama-worker/harness.yml):
   ```zsh
   PYTHONPATH="$PWD/ollama-worker" \
   "$PWD/ollama-worker/.venv/bin/python" \
   -m mcp_harness -c "$PWD/ollama-worker/harness.yml"
   ```
-- [ ] In Antigravity IDE/App, open **Additional Options (...) > MCP Servers** (or **Installed MCP Servers**) and click **Refresh** to connect `ollama-worker`. If using the `agy` CLI, run `/mcp` to verify `ollama-worker` is connected and exposes `list_local_ollama_models`, `delegate_coding_task`, resource `ollama://models`, and prompt `radical_spec`.
 
 ---
 
-## 4. Global Plugin Install (One-Click Toggle)
+## 4. Verification Tests
 
-The Skill and Rule live in `.agents/` as source templates. To enable them across all repositories with a single UI/CLI on-off toggle, package them as an Antigravity plugin under `~/.gemini/config/plugins/ollama-worker/`:
-
-- `plugin.json` — plugin manifest (`ollama-worker`)
-- `mcp_config.json` — STDIO `ollama-worker` server config (with your local repo path; move `"ollama-worker"` out of `~/.gemini/config/mcp_config.json` so toggling the plugin controls everything together)
-- `skills/radical-spec-delegate/SKILL.md` — copied from `.agents/skills/radical-spec-delegate/SKILL.md`
-- `rules/AGENTS.md` — copied from `.agents/rules/quota-delegation.md`
-
----
-
-## 5. Verification Tests
-
-- [ ] **Offline Protocol & Policy Check:**
+- [ ] **Offline Protocol, Fallback & Policy Check:**
   ```zsh
   ./ollama-worker/.venv/bin/python ./ollama-worker/test_worker.py --offline-only
   ```
@@ -115,13 +102,15 @@ The Skill and Rule live in `.agents/` as source templates. To enable them across
 
 ---
 
-## 6. Troubleshooting Quick Checks
+## 5. Troubleshooting Quick Checks
 
+- **Config drift after editing `.agents/skills/` or `.agents/rules/`:**
+  Re-run `./install_plugin.sh` so `~/.gemini/config/plugins/ollama-worker/` picks up the latest repo changes.
 - **Stdio JSON framing errors / MCP disconnect on startup:**
-  Ensure nothing prints to `stdout` in `server.py`. Confirm `logging.basicConfig(stream=sys.stderr, level=logging.WARNING, force=True)` stays at the very top of `ollama-worker/server.py` before any `google.antigravity` or `mcp_harness` imports.
+  Ensure nothing prints to `stdout` in `server.py`. Confirm `logging.basicConfig(stream=sys.stderr, level=logging.WARNING, force=True)` stays at the very top of `ollama-worker/server.py` before any `google.antigravity`, `mcp`, or `mcp_harness` imports.
 - **Model forgets instructions or truncates tool calls:**
   Run `ollama ps` during a task and check `CONTEXT`. If it shows `4096` or `8192` instead of `32768`, `launchctl setenv` was not picked up—fully quit Ollama (`pkill -x Ollama`) and relaunch it.
 - **Slow generation / CPU-GPU offload split (`CPU/GPU` split in `ollama ps`):**
   The loaded model + `32768` KV cache exceeds available VRAM. Switch to a smaller model (e.g., `qwen2.5-coder:7b` or `gemma4-32k:latest`), or lower `OLLAMA_CONTEXT_LENGTH` to `16384`.
 - **Stale `.venv` or wrong Python path:**
-  Verify `./ollama-worker/.venv/bin/python --version` works and matches the `"command"` path in your `mcp_config.json`.
+  Verify `./ollama-worker/.venv/bin/python --version` works and matches the `"command"` path in your generated `mcp_config.json`.

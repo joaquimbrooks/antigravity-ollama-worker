@@ -1,4 +1,4 @@
-"""Standalone smoke test for the mcp-harness-backed ollama-worker server."""
+"""Standalone smoke test for ollama-worker (supports both mcp-harness and MCPServer fallback)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from pathlib import Path
 
 from google.antigravity import Agent, LocalOpenAIAgentConfig, types
 from google.antigravity.hooks import hooks, policy
-from mcp_harness.providers.base import BaseProvider
 
 # Ensure local imports work regardless of current working directory.
 WORKER_DIR = Path(__file__).resolve().parent
@@ -25,8 +24,64 @@ if str(WORKER_DIR) not in sys.path:
 import server  # noqa: E402
 
 
+async def verify_mcpserver_fallback() -> bool:
+    """Verify the zero-extra-dependency MCPServer fallback registers tools, resource, and prompt."""
+    mcp_srv = server.create_mcpserver_fallback()
+
+    tools = {t.name: t for t in await mcp_srv.list_tools()}
+    if "list_local_ollama_models" not in tools or "delegate_coding_task" not in tools:
+        print(f"[FAIL] Missing expected tools in MCPServer fallback: {list(tools.keys())}")
+        return False
+
+    resources = {str(r.uri): r for r in await mcp_srv.list_resources()}
+    if "ollama://models" not in resources:
+        print(f"[FAIL] Missing ollama://models in MCPServer fallback: {list(resources.keys())}")
+        return False
+
+    res_contents = await mcp_srv.read_resource("ollama://models")
+    if not res_contents:
+        print("[FAIL] Empty resource response from MCPServer fallback.")
+        return False
+    json.loads(res_contents[0].content)
+
+    prompts = {p.name: p for p in await mcp_srv.list_prompts()}
+    if "radical_spec" not in prompts:
+        print(f"[FAIL] Missing radical_spec in MCPServer fallback: {list(prompts.keys())}")
+        return False
+
+    prompt_res = await mcp_srv.get_prompt(
+        "radical_spec",
+        {"objective": "Add unit tests", "workspace_path": "/tmp/example"},
+    )
+    if not prompt_res.messages or "Add unit tests" not in prompt_res.messages[0].content.text:
+        print(f"[FAIL] Unexpected MCPServer prompt response: {prompt_res}")
+        return False
+
+    tool_res = await mcp_srv.call_tool(
+        "delegate_coding_task",
+        {"spec": "Test spec", "workspace_path": "relative/path"},
+    )
+    # mcp 2.x returns CallToolResult(.content); older versions return sequence/tuple
+    content_items = getattr(tool_res, "content", None)
+    if content_items is None:
+        content_items = tool_res[0] if isinstance(tool_res, tuple) else tool_res
+    text = getattr(content_items[0], "text", str(content_items[0])) if content_items else ""
+    if "must be an absolute directory path" not in text:
+        print(f"[FAIL] Unexpected MCPServer fallback validation error: {tool_res!r}")
+        return False
+
+    print("[PASS] MCPServer fallback tools, resource, prompt, and validation verified.")
+    return True
+
+
 async def verify_provider_and_protocol() -> bool:
-    """Verify BaseProvider inheritance, JSON-RPC 2.0 routing, schemas, resources, and prompts."""
+    """Verify optional mcp-harness BaseProvider inheritance and ProtocolEngine routing."""
+    if not server.HAS_MCP_HARNESS:
+        print("[SKIP] mcp-harness not installed; skipping BaseProvider/ProtocolEngine checks.")
+        return True
+
+    from mcp_harness.providers.base import BaseProvider
+
     provider = server.OllamaWorkerProvider()
     if not isinstance(provider, BaseProvider):
         print(f"[FAIL] OllamaWorkerProvider is not a BaseProvider: {type(provider)}")
@@ -147,7 +202,18 @@ async def verify_provider_and_protocol() -> bool:
 def verify_stdio_wire_purity() -> bool:
     """Spawn server.py over STDIO and verify stdout emits only clean JSON-RPC lines."""
     requests = [
-        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "smoke-test", "version": "0.1.0"},
+                },
+            }
+        ),
         json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     ]
@@ -291,25 +357,23 @@ async def main() -> int:
     parser.add_argument(
         "--offline-only",
         action="store_true",
-        help="Only verify protocol, STDIO wire purity, and deny policy without requiring Ollama.",
+        help="Only verify protocol, fallback, STDIO wire purity, and deny policy.",
     )
     args = parser.parse_args()
 
-    print(
-        f"[PASS] Imported server.py cleanly "
-        f"(MCPHarness server_name={server.harness.server_name!r})."
-    )
+    mode = "mcp-harness" if server.HAS_MCP_HARNESS else "MCPServer-fallback"
+    print(f"[PASS] Imported server.py cleanly (active runtime={mode}).")
 
-    protocol_ok = await verify_provider_and_protocol()
-    if not protocol_ok:
+    if not await verify_mcpserver_fallback():
         return 1
 
-    stdio_ok = verify_stdio_wire_purity()
-    if not stdio_ok:
+    if not await verify_provider_and_protocol():
         return 1
 
-    policy_ok = await verify_deny_policy()
-    if not policy_ok:
+    if not verify_stdio_wire_purity():
+        return 1
+
+    if not await verify_deny_policy():
         return 1
 
     if args.offline_only:

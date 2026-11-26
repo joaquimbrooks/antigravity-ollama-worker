@@ -1,4 +1,4 @@
-"""mcp-harness BaseProvider implementation for local Ollama coding delegation."""
+"""Local Ollama coding delegation core and optional mcp-harness BaseProvider."""
 
 from __future__ import annotations
 
@@ -10,15 +10,23 @@ import urllib.request
 from typing import Any
 
 from google.antigravity import Agent, LocalOpenAIAgentConfig
-from mcp_harness.providers.base import (
-    BaseProvider,
-    PromptArgument,
-    prompt,
-    resource,
-    tool,
-)
 
 from policies import build_worker_policies
+
+try:
+    from mcp_harness.providers.base import (
+        BaseProvider,
+        PromptArgument,
+        prompt,
+        resource,
+        tool,
+    )
+
+    HAS_MCP_HARNESS = True
+except ImportError:
+    BaseProvider = None  # type: ignore[assignment,misc]
+    PromptArgument = None  # type: ignore[assignment,misc]
+    HAS_MCP_HARNESS = False
 
 DEFAULT_MODEL = "gemma4-32k:latest"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
@@ -33,8 +41,8 @@ def _format_size_gb(size_bytes: int | float | None) -> str:
     return f"{gb:.2f} GB"
 
 
-class OllamaWorkerProvider(BaseProvider):
-    """MCP provider delegating coding tasks to local Ollama via google-antigravity."""
+class OllamaWorkerCore:
+    """Framework-agnostic Ollama delegation engine shared by MCPServer and mcp-harness."""
 
     def __init__(
         self,
@@ -52,25 +60,17 @@ class OllamaWorkerProvider(BaseProvider):
             ollama_tags_url or os.environ.get("OLLAMA_TAGS_URL") or OLLAMA_TAGS_URL
         )
 
-    @property
-    def name(self) -> str:
-        return "ollama-worker"
-
-    def _fetch_ollama_tags(self) -> dict[str, Any]:
+    def fetch_ollama_tags(self) -> dict[str, Any]:
         """Query the local Ollama /api/tags endpoint and return parsed JSON."""
         req = urllib.request.Request(self.ollama_tags_url, method="GET")
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             payload: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
         return payload
 
-    @tool(
-        name="list_local_ollama_models",
-        description="Query the local Ollama server and return installed model tags and sizes.",
-    )
     def list_local_ollama_models(self) -> str:
         """Query the local Ollama server and return installed model tags and sizes."""
         try:
-            payload = self._fetch_ollama_tags()
+            payload = self.fetch_ollama_tags()
         except urllib.error.URLError as exc:
             return (
                 f"Error: Could not reach local Ollama at {self.ollama_tags_url} ({exc.reason}). "
@@ -99,10 +99,6 @@ class OllamaWorkerProvider(BaseProvider):
 
         return "\n".join(lines)
 
-    @tool(
-        name="delegate_coding_task",
-        description="Delegate a self-contained Radical Spec coding task to a local Ollama model.",
-    )
     async def delegate_coding_task(
         self,
         spec: str,
@@ -182,16 +178,10 @@ class OllamaWorkerProvider(BaseProvider):
         )
         return "\n".join(lines)
 
-    @resource(
-        uri_pattern="ollama://models",
-        name="Local Ollama Models",
-        description="Read-only JSON snapshot of installed local Ollama models.",
-        mime_type="application/json",
-    )
-    def read_models_resource(self, uri: str) -> dict[str, Any]:
-        """Return installed Ollama models as an MCP JSON resource payload."""
+    def models_snapshot_json(self) -> str:
+        """Return installed Ollama models (or connection diagnostic) serialized as JSON."""
         try:
-            payload = self._fetch_ollama_tags()
+            payload = self.fetch_ollama_tags()
             data: dict[str, Any] = {
                 "endpoint": self.ollama_tags_url,
                 "default_model": self.default_model,
@@ -204,42 +194,16 @@ class OllamaWorkerProvider(BaseProvider):
                 "error": f"{type(exc).__name__}: {exc}",
                 "models": [],
             }
+        return json.dumps(data, indent=2)
 
-        return {
-            "uri": uri,
-            "mimeType": "application/json",
-            "text": json.dumps(data, indent=2),
-        }
-
-    @prompt(
-        name="radical_spec",
-        description="Generate a structured self-contained Radical Spec prompt for local Ollama coding delegation.",
-        arguments=[
-            PromptArgument(
-                name="objective",
-                description="Desired behavior, refactor, or bug fix.",
-                required=True,
-            ),
-            PromptArgument(
-                name="workspace_path",
-                description="Absolute path to the target project workspace.",
-                required=True,
-            ),
-            PromptArgument(
-                name="verification_command",
-                description="Exact verification command to run after changes.",
-                required=False,
-            ),
-        ],
-    )
-    def radical_spec_prompt(
-        self,
+    @staticmethod
+    def build_radical_spec_text(
         objective: str,
         workspace_path: str,
         verification_command: str = "pytest -q",
-    ) -> dict[str, Any]:
-        """Return a structured Radical Spec prompt message for local worker delegation."""
-        template = (
+    ) -> str:
+        """Render a structured Radical Spec prompt body."""
+        return (
             f"# Radical Spec\n\n"
             f"## Objective\n{objective}\n\n"
             f"## Workspace\n`{workspace_path}`\n\n"
@@ -256,23 +220,132 @@ class OllamaWorkerProvider(BaseProvider):
             f"## Return Format\n"
             f"Summarize files changed, commands run, and verification output."
         )
-        return {
-            "description": "Structured Radical Spec prompt for local Ollama delegation.",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": template,
-                    },
-                }
+
+
+if HAS_MCP_HARNESS:
+
+    class OllamaWorkerProvider(BaseProvider):  # type: ignore[valid-type,misc]
+        """mcp-harness BaseProvider wrapping OllamaWorkerCore."""
+
+        def __init__(
+            self,
+            default_model: str | None = None,
+            default_base_url: str | None = None,
+            ollama_tags_url: str | None = None,
+        ) -> None:
+            self.core = OllamaWorkerCore(
+                default_model=default_model,
+                default_base_url=default_base_url,
+                ollama_tags_url=ollama_tags_url,
+            )
+
+        @property
+        def name(self) -> str:
+            return "ollama-worker"
+
+        @tool(
+            name="list_local_ollama_models",
+            description="Query the local Ollama server and return installed model tags and sizes.",
+        )
+        def list_local_ollama_models(self) -> str:
+            """Query the local Ollama server and return installed model tags and sizes."""
+            return self.core.list_local_ollama_models()
+
+        @tool(
+            name="delegate_coding_task",
+            description="Delegate a self-contained Radical Spec coding task to a local Ollama model.",
+        )
+        async def delegate_coding_task(
+            self,
+            spec: str,
+            workspace_path: str,
+            model: str = "",
+            base_url: str = "",
+        ) -> str:
+            """Delegate a self-contained Radical Spec coding task to a local Ollama model.
+
+            Args:
+            spec: Complete, self-contained Radical Spec (objective, file scope, contracts, ordered steps, and verification command).
+            workspace_path: Absolute path to the target project workspace directory.
+            model: Local Ollama model tag (e.g. 'gemma4-32k:latest', 'qwen2.5-coder:7b'). Leave empty to use provider default.
+            base_url: Local OpenAI-compatible Ollama endpoint URL. Leave empty to use provider default.
+            """
+            return await self.core.delegate_coding_task(
+                spec=spec,
+                workspace_path=workspace_path,
+                model=model,
+                base_url=base_url,
+            )
+
+        @resource(
+            uri_pattern="ollama://models",
+            name="Local Ollama Models",
+            description="Read-only JSON snapshot of installed local Ollama models.",
+            mime_type="application/json",
+        )
+        def read_models_resource(self, uri: str) -> dict[str, Any]:
+            """Return installed Ollama models as an MCP JSON resource payload."""
+            return {
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": self.core.models_snapshot_json(),
+            }
+
+        @prompt(
+            name="radical_spec",
+            description="Generate a structured self-contained Radical Spec prompt for local Ollama coding delegation.",
+            arguments=[
+                PromptArgument(
+                    name="objective",
+                    description="Desired behavior, refactor, or bug fix.",
+                    required=True,
+                ),
+                PromptArgument(
+                    name="workspace_path",
+                    description="Absolute path to the target project workspace.",
+                    required=True,
+                ),
+                PromptArgument(
+                    name="verification_command",
+                    description="Exact verification command to run after changes.",
+                    required=False,
+                ),
             ],
-        }
+        )
+        def radical_spec_prompt(
+            self,
+            objective: str,
+            workspace_path: str,
+            verification_command: str = "pytest -q",
+        ) -> dict[str, Any]:
+            """Return a structured Radical Spec prompt message for local worker delegation."""
+            template = self.core.build_radical_spec_text(
+                objective=objective,
+                workspace_path=workspace_path,
+                verification_command=verification_command,
+            )
+            return {
+                "description": "Structured Radical Spec prompt for local Ollama delegation.",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": template,
+                        },
+                    }
+                ],
+            }
+
+else:
+    OllamaWorkerProvider = None  # type: ignore[assignment,misc]
 
 
 __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_BASE_URL",
     "OLLAMA_TAGS_URL",
+    "HAS_MCP_HARNESS",
+    "OllamaWorkerCore",
     "OllamaWorkerProvider",
 ]

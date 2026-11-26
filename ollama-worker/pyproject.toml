@@ -1,10 +1,14 @@
 [project]
 name = "ollama-worker"
 version = "0.1.0"
-description = "ToS-safe local Ollama delegation worker built on mcp-harness and the Google Antigravity Python SDK."
+description = "ToS-safe local Ollama delegation worker for Google Antigravity, with optional mcp-harness integration."
 requires-python = ">=3.10"
 dependencies = [
     "google-antigravity>=0.1.24",
+]
+
+[project.optional-dependencies]
+harness = [
     "mcp-harness>=0.1.0",
     "pyyaml>=6.0.0",
 ]

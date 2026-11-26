@@ -1,0 +1,11 @@
+{
+  "name": "ollama-worker",
+  "displayName": "Ollama Worker",
+  "version": "0.1.0",
+  "description": "ToS-safe local Ollama coding delegation worker backed by the google-antigravity SDK (with optional mcp-harness support), Radical Spec workflow, and quota-delegation rule.",
+  "suggestedPrompts": [
+    "List installed local Ollama models and recommend one for this task",
+    "Delegate a multi-file implementation to ollama-worker using a Radical Spec",
+    "Generate unit tests locally via ollama-worker and review the git diff"
+  ]
+}
