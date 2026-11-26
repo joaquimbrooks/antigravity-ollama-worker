@@ -68,6 +68,14 @@ If you use a custom MCP runtime implementing the `mcp-harness` interface (`mcp_h
 
    *(Alternative standalone config: preview resolved JSON with `sed "s|/path/to/antigravity-ollama-worker|$PWD|g" ollama-worker/mcp_config.snippet.json` and merge it into `~/.gemini/config/mcp_config.json`.)*
 
+### Using with Other MCP Clients (Codex CLI, Claude Code, Cursor, etc.)
+
+Because `ollama-worker/server.py` speaks standard **STDIO JSON-RPC 2.0 MCP**, any MCP-capable client can mount it with the same `command` + `args` from `ollama-worker/mcp_config.snippet.json` (and `.agents/skills/radical-spec-delegate/SKILL.md` follows the portable `SKILL.md` format).
+
+When calling `delegate_coding_task` from any client or harness:
+- Pass an **absolute** `workspace_path` and a self-contained **Radical Spec** (objective, file scope, invariants, ordered steps, and verification command).
+- `policies.py` enforces the `run_command` safety guard locally regardless of which MCP client initiated the request.
+
 See [CHECKLIST.md](CHECKLIST.md) for Ollama memory/context tuning (`OLLAMA_CONTEXT_LENGTH=32768`), verification steps, and troubleshooting.
 
 ---
