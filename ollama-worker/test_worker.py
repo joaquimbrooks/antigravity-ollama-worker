@@ -29,7 +29,11 @@ async def verify_mcpserver_fallback() -> bool:
     mcp_srv = server.create_mcpserver_fallback()
 
     tools = {t.name: t for t in await mcp_srv.list_tools()}
-    if "list_local_ollama_models" not in tools or "delegate_coding_task" not in tools:
+    if (
+        "list_local_ollama_models" not in tools
+        or "delegate_coding_task" not in tools
+        or "get_worker_scaling_profile" not in tools
+    ):
         print(f"[FAIL] Missing expected tools in MCPServer fallback: {list(tools.keys())}")
         return False
 
@@ -42,7 +46,10 @@ async def verify_mcpserver_fallback() -> bool:
     if not res_contents:
         print("[FAIL] Empty resource response from MCPServer fallback.")
         return False
-    json.loads(res_contents[0].content)
+    snapshot = json.loads(res_contents[0].content)
+    if "host_profile" not in snapshot:
+        print(f"[FAIL] Missing 'host_profile' in ollama://models snapshot: {list(snapshot.keys())}")
+        return False
 
     prompts = {p.name: p for p in await mcp_srv.list_prompts()}
     if "radical_spec" not in prompts:
@@ -106,7 +113,11 @@ async def verify_provider_and_protocol() -> bool:
     )
     tools_resp = json.loads(tools_raw or "{}")
     tools = {t["name"]: t for t in tools_resp.get("result", {}).get("tools", [])}
-    if "list_local_ollama_models" not in tools or "delegate_coding_task" not in tools:
+    if (
+        "list_local_ollama_models" not in tools
+        or "delegate_coding_task" not in tools
+        or "get_worker_scaling_profile" not in tools
+    ):
         print(f"[FAIL] Missing expected tools in tools/list: {list(tools.keys())}")
         return False
 
@@ -141,7 +152,10 @@ async def verify_provider_and_protocol() -> bool:
     if not contents or contents[0].get("uri") != "ollama://models":
         print(f"[FAIL] Unexpected resources/read response: {res_read_resp}")
         return False
-    json.loads(contents[0].get("text", ""))
+    snapshot = json.loads(contents[0].get("text", ""))
+    if "host_profile" not in snapshot:
+        print(f"[FAIL] Missing 'host_profile' in ollama://models snapshot: {list(snapshot.keys())}")
+        return False
 
     # 4. prompts/list & prompts/get
     prompts_list_raw = await engine.handle_message(
@@ -347,6 +361,153 @@ async def run_live_agent_smoke_test(model: str) -> bool:
         return True
 
 
+async def verify_hardware_and_scaling() -> bool:
+    """Verify host hardware scaling tiers, env overrides, warnings, and WorkerSlotGate."""
+    import hardware
+
+    # 1. Synthetic hardware tier checks
+    hw_16gb = hardware.HostHardware(
+        os_name="Darwin",
+        arch="arm64",
+        cpu_brand="Apple M1",
+        logical_cores=8,
+        perf_cores=4,
+        total_ram_gb=16.0,
+        gpu_vram_gb=None,
+        is_unified_memory=True,
+    )
+    prof_16gb = hardware.build_scaling_profile(hardware=hw_16gb, env={})
+    if (
+        prof_16gb.tier != "compact-<=16gb"
+        or prof_16gb.max_parallel_workers != 2
+        or prof_16gb.recommended_single_model != "gemma4-32k:latest"
+        or prof_16gb.recommended_parallel_model != "qwen2.5-coder:7b"
+        or not any("KV cache" in w for w in prof_16gb.warnings)
+    ):
+        print(f"[FAIL] Unexpected compact 16GB scaling profile: {prof_16gb}")
+        return False
+
+    hw_1core = hardware.HostHardware(
+        os_name="Linux",
+        arch="x86_64",
+        cpu_brand="Generic CPU",
+        logical_cores=1,
+        perf_cores=1,
+        total_ram_gb=16.0,
+        gpu_vram_gb=None,
+        is_unified_memory=False,
+    )
+    prof_1core = hardware.build_scaling_profile(hardware=hw_1core, env={})
+    if prof_1core.max_parallel_workers != 1:
+        print(f"[FAIL] Expected 1-core host max_parallel_workers=1, got {prof_1core.max_parallel_workers}")
+        return False
+
+    hw_32gb = hardware.HostHardware(
+        os_name="Darwin",
+        arch="arm64",
+        cpu_brand="Apple M3 Pro",
+        logical_cores=12,
+        perf_cores=6,
+        total_ram_gb=32.0,
+        gpu_vram_gb=None,
+        is_unified_memory=True,
+    )
+    prof_32gb = hardware.build_scaling_profile(hardware=hw_32gb, env={})
+    if (
+        prof_32gb.tier != "mid-24gb-36gb"
+        or prof_32gb.max_parallel_workers != 2
+        or prof_32gb.recommended_ollama_max_loaded_models != 2
+    ):
+        print(f"[FAIL] Unexpected mid 32GB scaling profile: {prof_32gb}")
+        return False
+
+    hw_64gb = hardware.HostHardware(
+        os_name="Darwin",
+        arch="arm64",
+        cpu_brand="Apple M3 Max",
+        logical_cores=16,
+        perf_cores=12,
+        total_ram_gb=64.0,
+        gpu_vram_gb=None,
+        is_unified_memory=True,
+    )
+    prof_64gb = hardware.build_scaling_profile(hardware=hw_64gb, env={})
+    if (
+        prof_64gb.tier != "high-48gb+"
+        or prof_64gb.max_parallel_workers != 4
+        or prof_64gb.recommended_context_length != 65536
+    ):
+        print(f"[FAIL] Unexpected high 64GB scaling profile: {prof_64gb}")
+        return False
+
+    # 2. Override checks & malformed input resilience
+    prof_capped = hardware.build_scaling_profile(
+        hardware=hw_16gb, env={"OLLAMA_WORKER_MAX_CORES": "1"}
+    )
+    if prof_capped.max_parallel_workers != 1:
+        print(f"[FAIL] OLLAMA_WORKER_MAX_CORES=1 did not cap parallelism: {prof_capped}")
+        return False
+
+    prof_custom = hardware.build_scaling_profile(
+        hardware=hw_16gb,
+        env={
+            "OLLAMA_WORKER_MAX_PARALLEL": "3",
+            "OLLAMA_WORKER_MEMORY_GB": "16",
+            "OLLAMA_WORKER_CONTEXT_LENGTH": "16384",
+            "OLLAMA_WORKER_MODEL": "custom:7b",
+            "OLLAMA_WORKER_PARALLEL_MODEL": "fast:3b",
+            "OLLAMA_WORKER_MAX_CORES": "not-an-int",
+        },
+    )
+    if (
+        prof_custom.max_parallel_workers != 3
+        or prof_custom.recommended_context_length != 16384
+        or prof_custom.recommended_single_model != "custom:7b"
+        or prof_custom.recommended_parallel_model != "fast:3b"
+        or not any("oversubscription" in w.lower() for w in prof_custom.warnings)
+        or not any("malformed" in w.lower() for w in prof_custom.warnings)
+    ):
+        print(f"[FAIL] Unexpected custom override / warning behavior: {prof_custom}")
+        return False
+
+    # 3. WorkerSlotGate concurrency + workspace collision checks
+    with tempfile.TemporaryDirectory(prefix="ollama_slot_gate_") as lock_dir:
+        gate = hardware.WorkerSlotGate(max_slots=2, lock_dir=lock_dir)
+        ws_a = str(Path(lock_dir) / "ws_a")
+        Path(ws_a).mkdir()
+
+        async with gate.acquire(workspace_path=ws_a) as lease1:
+            if lease1.workspace_collision or lease1.active_slots != 1:
+                print(f"[FAIL] Unexpected first lease: {lease1}")
+                return False
+
+            acquired_third = asyncio.Event()
+
+            async with gate.acquire(workspace_path=ws_a) as lease2:
+                if not lease2.workspace_collision or lease2.active_slots != 2:
+                    print(f"[FAIL] Expected workspace collision & 2 active slots on lease2: {lease2}")
+                    return False
+
+                async def _wait_third() -> None:
+                    async with gate.acquire(workspace_path="") as lease3:
+                        if lease3.workspace_collision:
+                            raise AssertionError(f"Unexpected collision on lease3: {lease3}")
+                        acquired_third.set()
+
+                third_task = asyncio.create_task(_wait_third())
+                await asyncio.sleep(0.15)
+                if acquired_third.is_set():
+                    print("[FAIL] Third task acquired slot before 2nd slot released.")
+                    third_task.cancel()
+                    return False
+
+            await asyncio.wait_for(acquired_third.wait(), timeout=2.0)
+            await third_task
+
+    print("[PASS] Host hardware scaling profiles, overrides, warnings, and WorkerSlotGate verified.")
+    return True
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test ollama-worker.")
     parser.add_argument(
@@ -374,6 +535,9 @@ async def main() -> int:
         return 1
 
     if not await verify_deny_policy():
+        return 1
+
+    if not await verify_hardware_and_scaling():
         return 1
 
     if args.offline_only:

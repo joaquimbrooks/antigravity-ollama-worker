@@ -23,6 +23,11 @@ if _WORKER_DIR not in sys.path:
 
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
+from hardware import (  # noqa: E402
+    WorkerScalingProfile,
+    WorkerSlotGate,
+    build_scaling_profile,
+)
 from policies import (  # noqa: E402
     BLOCKED_COMMAND_PATTERNS,
     build_worker_policies,
@@ -78,6 +83,11 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
     def list_local_ollama_models() -> str:
         """Query the local Ollama server and return installed model tags and sizes."""
         return worker_core.list_local_ollama_models()
+
+    @mcp_server.tool()
+    def get_worker_scaling_profile() -> str:
+        """Inspect detected host hardware, active concurrency limits, recommended models, and scaling warnings."""
+        return worker_core.get_worker_scaling_profile()
 
     @mcp_server.tool()
     async def delegate_coding_task(
@@ -158,6 +168,9 @@ __all__ = [
     "OLLAMA_TAGS_URL",
     "HAS_MCP_HARNESS",
     "BLOCKED_COMMAND_PATTERNS",
+    "WorkerScalingProfile",
+    "WorkerSlotGate",
+    "build_scaling_profile",
     "is_blocked_command",
     "build_worker_policies",
     "OllamaWorkerCore",

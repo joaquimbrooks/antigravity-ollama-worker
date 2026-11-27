@@ -11,6 +11,11 @@ from typing import Any
 
 from google.antigravity import Agent, LocalOpenAIAgentConfig
 
+from hardware import (
+    WorkerScalingProfile,
+    WorkerSlotGate,
+    build_scaling_profile,
+)
 from policies import build_worker_policies
 
 try:
@@ -50,8 +55,15 @@ class OllamaWorkerCore:
         default_base_url: str | None = None,
         ollama_tags_url: str | None = None,
     ) -> None:
+        self.scaling_profile: WorkerScalingProfile = build_scaling_profile()
+        self.slot_gate = WorkerSlotGate(
+            max_slots=self.scaling_profile.max_parallel_workers
+        )
         self.default_model = (
-            default_model or os.environ.get("OLLAMA_WORKER_MODEL") or DEFAULT_MODEL
+            default_model
+            or os.environ.get("OLLAMA_WORKER_MODEL")
+            or self.scaling_profile.recommended_single_model
+            or DEFAULT_MODEL
         )
         self.default_base_url = (
             default_base_url or os.environ.get("OLLAMA_WORKER_BASE_URL") or DEFAULT_BASE_URL
@@ -67,6 +79,10 @@ class OllamaWorkerCore:
             payload: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
         return payload
 
+    def get_worker_scaling_profile(self) -> str:
+        """Return detected host hardware profile, concurrency limits, and warnings."""
+        return self.scaling_profile.format_summary()
+
     def list_local_ollama_models(self) -> str:
         """Query the local Ollama server and return installed model tags and sizes."""
         try:
@@ -74,16 +90,21 @@ class OllamaWorkerCore:
         except urllib.error.URLError as exc:
             return (
                 f"Error: Could not reach local Ollama at {self.ollama_tags_url} ({exc.reason}). "
-                "Ensure Ollama is running (e.g. open -a Ollama or `ollama serve`)."
+                "Ensure Ollama is running (e.g. open -a Ollama or `ollama serve`).\n\n"
+                f"{self.scaling_profile.format_summary()}"
             )
         except Exception as exc:  # noqa: BLE001
-            return f"Error querying local Ollama models: {type(exc).__name__}: {exc}"
+            return (
+                f"Error querying local Ollama models: {type(exc).__name__}: {exc}\n\n"
+                f"{self.scaling_profile.format_summary()}"
+            )
 
         models = payload.get("models") or []
         if not models:
             return (
                 "Ollama is running, but no local models are installed. "
-                "Pull a tool-capable model first (e.g. `ollama pull qwen3:14b`)."
+                "Pull a tool-capable model first (e.g. `ollama pull gemma4-32k:latest`).\n\n"
+                f"{self.scaling_profile.format_summary()}"
             )
 
         lines = [f"Installed local Ollama models ({len(models)}):"]
@@ -97,6 +118,8 @@ class OllamaWorkerCore:
             suffix = f" [{meta}]" if meta else ""
             lines.append(f"- {model_name} ({size_str}){suffix}")
 
+        lines.append("")
+        lines.append(self.scaling_profile.format_summary())
         return "\n".join(lines)
 
     async def delegate_coding_task(
@@ -142,25 +165,51 @@ class OllamaWorkerCore:
         output_chunks: list[str] = []
         status = "completed"
         error_detail = ""
+        runtime_warnings: list[str] = []
 
-        try:
-            async with Agent(config) as agent:
-                response = await agent.chat(spec)
-                async for token in response:
-                    output_chunks.append(token)
-        except asyncio.CancelledError:
-            status = "cancelled"
-            error_detail = "Task was cancelled before completion."
-        except Exception as exc:  # noqa: BLE001
-            status = "error"
-            error_detail = f"{type(exc).__name__}: {exc}"
-        finally:
-            partial_output = "".join(output_chunks).strip()
+        async with self.slot_gate.acquire(workspace_path=workspace_path) as lease:
+            if lease.workspace_collision:
+                runtime_warnings.append(
+                    "[WARNING] Another concurrent ollama-worker task is active in the same "
+                    "workspace; use disjoint file scopes or separate git worktrees to avoid "
+                    "overlapping edits."
+                )
+            if (
+                lease.active_slots > 1
+                and self.scaling_profile.effective_memory_gb <= 18.0
+                and any(
+                    marker in resolved_model.lower()
+                    for marker in ("gemma4", "14b", "32b", "36b")
+                )
+            ):
+                runtime_warnings.append(
+                    f"[WARNING] {lease.active_slots} concurrent workers detected on a "
+                    f"{self.scaling_profile.effective_memory_gb:.1f} GB host using {resolved_model}; "
+                    f"prefer {self.scaling_profile.recommended_parallel_model} for parallel "
+                    "subagents to stay 100% GPU without swap/KV-cache spill."
+                )
+
+            try:
+                async with Agent(config) as agent:
+                    response = await agent.chat(spec)
+                    async for token in response:
+                        output_chunks.append(token)
+            except asyncio.CancelledError:
+                status = "cancelled"
+                error_detail = "Task was cancelled before completion."
+            except Exception as exc:  # noqa: BLE001
+                status = "error"
+                error_detail = f"{type(exc).__name__}: {exc}"
+            finally:
+                partial_output = "".join(output_chunks).strip()
+
+        warning_block = ("\n" + "\n".join(runtime_warnings) + "\n") if runtime_warnings else ""
 
         if status == "completed":
             body = partial_output or "(No text output returned by local worker.)"
             return (
-                f"[ollama-worker | model={resolved_model} | workspace={workspace_path}]\n\n"
+                f"[ollama-worker | model={resolved_model} | workspace={workspace_path}]\n"
+                f"{warning_block}\n"
                 f"{body}\n\n"
                 "---\n"
                 "Next step: Inspect `git diff` and `git status` in the workspace to verify "
@@ -169,8 +218,10 @@ class OllamaWorkerCore:
 
         lines = [
             f"[ollama-worker | status={status} | model={resolved_model} | workspace={workspace_path}]",
-            f"Diagnostic: {error_detail}",
         ]
+        if runtime_warnings:
+            lines.extend(runtime_warnings)
+        lines.append(f"Diagnostic: {error_detail}")
         if partial_output:
             lines.append(f"\nPartial output before {status}:\n{partial_output}")
         lines.append(
@@ -186,6 +237,7 @@ class OllamaWorkerCore:
                 "endpoint": self.ollama_tags_url,
                 "default_model": self.default_model,
                 "models": payload.get("models") or [],
+                "host_profile": self.scaling_profile.to_dict(),
             }
         except Exception as exc:  # noqa: BLE001
             data = {
@@ -193,6 +245,7 @@ class OllamaWorkerCore:
                 "default_model": self.default_model,
                 "error": f"{type(exc).__name__}: {exc}",
                 "models": [],
+                "host_profile": self.scaling_profile.to_dict(),
             }
         return json.dumps(data, indent=2)
 
@@ -250,6 +303,14 @@ if HAS_MCP_HARNESS:
         def list_local_ollama_models(self) -> str:
             """Query the local Ollama server and return installed model tags and sizes."""
             return self.core.list_local_ollama_models()
+
+        @tool(
+            name="get_worker_scaling_profile",
+            description="Inspect detected host hardware, active concurrency limits, recommended models, and scaling warnings.",
+        )
+        def get_worker_scaling_profile(self) -> str:
+            """Return detected host hardware profile, concurrency limits, and warnings."""
+            return self.core.get_worker_scaling_profile()
 
         @tool(
             name="delegate_coding_task",

@@ -19,9 +19,11 @@ ollama-worker/server.py
          mcp.server.mcpserver.MCPServer (bundled with google-antigravity)
    │
    ├── @tool list_local_ollama_models
-   ├── @tool delegate_coding_task  ──► google-antigravity Agent(LocalOpenAIAgentConfig) ──► Ollama
-   ├── @resource ollama://models
+   ├── @tool get_worker_scaling_profile
+   ├── @tool delegate_coding_task  ──► WorkerSlotGate ──► Agent(LocalOpenAIAgentConfig) ──► Ollama
+   ├── @resource ollama://models (includes host_profile)
    ├── @prompt radical_spec
+   ├── hardware.py (host profiling, OLLAMA_WORKER_* overrides, warnings & fcntl slot gate)
    └── policies.py (policy.allow_all() + policy.deny("run_command", ...))
 ```
 
@@ -60,13 +62,33 @@ If you use a custom MCP runtime implementing the `mcp-harness` interface (`mcp_h
    ```
 
 4. **Install into Antigravity (Recommended: Toggleable Plugin, Single Source of Truth):**
-   Run the idempotent installer from the repo root to package `plugin/`, `.agents/`, and a resolved `mcp_config.json` into `~/.gemini/config/plugins/ollama-worker/`:
+   Run the idempotent installer from the repo root to package `plugin/`, `.agents/`, and a host-tuned `mcp_config.json` into `~/.gemini/config/plugins/ollama-worker/`:
    ```zsh
    ./install_plugin.sh
+   ```
+   To customize parallelism/cores/memory or apply recommended Ollama daemon settings (`launchctl setenv` on macOS):
+   ```zsh
+   ./install_plugin.sh --max-cores 2 --max-parallel 2 --tune-ollama
    ```
    Re-run `./install_plugin.sh` after editing `.agents/skills/` or `.agents/rules/` to keep your global plugin synced without config drift. You can then enable or disable the entire bundle (MCP server, skill, and rule) from Antigravity's **Customizations** UI.
 
    *(Alternative standalone config: preview resolved JSON with `sed "s|/path/to/antigravity-ollama-worker|$PWD|g" ollama-worker/mcp_config.snippet.json` and merge it into `~/.gemini/config/mcp_config.json`.)*
+
+### Dynamic Host Scaling, Overrides & Warnings
+
+`ollama-worker/hardware.py` inspects the host OS, CPU performance cores, and unified memory / GPU VRAM to select safe defaults (`compact-<=16gb`, `mid-24gb-36gb`, `high-48gb+`), enforced across STDIO subagents by `WorkerSlotGate` (`fcntl.flock` slot locks) and inspectable via `get_worker_scaling_profile` or `python3 ollama-worker/hardware.py --json`:
+
+- **Customization flags (`./install_plugin.sh`) & env vars (`OLLAMA_WORKER_*`):**
+  - `--max-parallel <N>` / `OLLAMA_WORKER_MAX_PARALLEL` — override max concurrent worker slots (`>= 1`)
+  - `--max-cores <N>` / `OLLAMA_WORKER_MAX_CORES` — override detected performance cores and cap auto parallelism
+  - `--memory-gb <GB>` / `OLLAMA_WORKER_MEMORY_GB` — override detected RAM/VRAM
+  - `--context-length <N>` / `OLLAMA_WORKER_CONTEXT_LENGTH` — override `OLLAMA_CONTEXT_LENGTH` (`>= 4096`)
+  - `--model <tag>` / `OLLAMA_WORKER_MODEL` — default single-worker model
+  - `--parallel-model <tag>` / `OLLAMA_WORKER_PARALLEL_MODEL` — recommended model for concurrent subagents
+  - `--tune-ollama` — apply recommended `OLLAMA_NUM_PARALLEL`, `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_KV_CACHE_TYPE`, and `OLLAMA_FLASH_ATTENTION` (`launchctl` on macOS; prints exports elsewhere)
+- **Built-in Warnings:**
+  - **KV-cache multiplication:** On `<= 16 GB` hosts, running 2 parallel slots allocates `2x` KV cache — prefer `qwen2.5-coder:7b` (`~4.4 GB`) over `gemma4-32k:latest` (`~9.0 GB`) for parallel subagents and keep `OLLAMA_MAX_LOADED_MODELS=1` to avoid swap spill or model thrashing.
+  - **Workspace collisions:** Running two concurrent `delegate_coding_task` calls in the same directory emits a collision warning; assign disjoint files or separate `git worktree` paths.
 
 ### Using with Other MCP Clients (Codex CLI, Claude Code, Cursor, etc.)
 

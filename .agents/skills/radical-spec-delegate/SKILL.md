@@ -47,14 +47,19 @@ Act strictly as **Principal Architect & Diff Reviewer**. Preserve cloud model qu
 - **`ollama-worker` MCP tools are missing:** `ollama-worker` runs as a **STDIO** MCP server spawned automatically by Antigravity from `~/.gemini/config/mcp_config.json`. Do **not** launch `server.py` manually in a terminal or background shell (a separate process cannot attach to Antigravity's STDIO pipe). Instead, ask the user to click **Refresh** in **Installed MCP Servers** (or run `/mcp` in CLI).
 - **Local Ollama daemon is unreachable (`http://localhost:11434`):** If `list_local_ollama_models` or `delegate_coding_task` reports Ollama is not running, start the Ollama daemon (`open -a Ollama` on macOS, or `ollama serve`) before retrying.
 
-## Local Model Selection & Machine Memory (16 GB Reference)
+## Dynamic Host Scaling & Parallel Subagents
 
-- **Memory ceiling:** On 16 GB unified-memory / VRAM machines, keep model weights + KV cache under ~12–13 GB so execution stays `100% GPU`. Avoid models exceeding available memory (e.g., 23 GB+ models on 16 GB RAM) unless explicitly requested — they spill into CPU/swap offload.
+- **Inspect host capacity first:** Call `ollama-worker:list_local_ollama_models` or `ollama-worker:get_worker_scaling_profile` to view the detected host tier, effective cores/memory, `max_parallel_workers`, recommended single vs. parallel models, and any active warnings.
+- **KV cache multiplies with `OLLAMA_NUM_PARALLEL`:** On **<= 16 GB** unified-memory / VRAM machines, running 2 parallel slots allocates `2x` KV cache alongside model weights. Use `gemma4-32k:latest` (`~9.0 GB`) for **single-worker** tasks, and switch to `qwen2.5-coder:7b` (`~4.4 GB`) when fanning out **2 parallel subagents** so both slots stay `100% GPU` without CPU/swap spill.
+- **Avoid model thrashing (`OLLAMA_MAX_LOADED_MODELS=1`):** When running parallel subagents on compact hosts, keep all concurrent workers on the **same** model tag (`qwen2.5-coder:7b`). Mixing models forces Ollama to repeatedly evict and reload multi-GB weights.
+- **Isolate parallel edits:** Never run two parallel `delegate_coding_task` calls against overlapping files in the same workspace. Assign strictly disjoint file scopes or separate `git worktree` paths (the worker slot gate emits a collision warning when concurrent tasks share a workspace).
+- **Host overrides:** Tune or cap host scaling without editing code via `OLLAMA_WORKER_MAX_PARALLEL`, `OLLAMA_WORKER_MAX_CORES`, `OLLAMA_WORKER_MEMORY_GB`, `OLLAMA_WORKER_CONTEXT_LENGTH`, `OLLAMA_WORKER_MODEL`, and `OLLAMA_WORKER_PARALLEL_MODEL` (or `./install_plugin.sh --max-cores <N> --max-parallel <N> --tune-ollama`).
 - **Tool-calling required:** `delegate_coding_task` runs an agentic tool loop, so only select models with `tools` capability. Never pass embedding models (`nomic-embed-text`, `bge-m3`, `all-minilm`) or completion-only models (`gemma2:9b`).
 
 | Model Tag | Size / Quant | Capabilities | Best For |
 | :--- | :--- | :--- | :--- |
-| `gemma4-32k:latest` *(default)* | `9.6 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Multi-file features, refactors, complex debugging, larger Radical Specs |
-| `qwen2.5-coder:7b` | `4.7 GB` (`7.6B Q4_K_M`) | `tools` | Fast single-file edits, unit tests, iterative `pytest`/`ruff` loops, tight RAM |
-| `llama3.1:8b-instruct-q8_0` | `8.5 GB` (`8.0B Q8_0`) | `tools` | Strict schema/formatting adherence and instruction-following |
-| `gemma4:latest` | `9.6 GB` (`8.0B Q4_K_M`) | `tools`, `thinking` | Fallback only — prefer `gemma4-32k:latest` for explicit 32K `num_ctx` |
+| `gemma4-32k:latest` *(single-worker default)* | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Single-worker multi-file features, refactors, larger Radical Specs (or 2 parallel on 24 GB+ hosts) |
+| `qwen2.5-coder:7b` *(<=16 GB parallel default)* | `4.36 GB` (`7.6B Q4_K_M`) | `tools` | 2 concurrent subagents on <=16 GB hosts, fast single-file edits, unit tests, `pytest`/`ruff` loops |
+| `llama3.1:8b-instruct-q8_0` | `7.95 GB` (`8.0B Q8_0`) | `tools` | Strict schema/formatting adherence and instruction-following |
+| `qwen2.5-coder:14b` *(24–48 GB+ hosts)* | `~9–10 GB` (`14B Q4_K_M`) | `tools` | High-memory hosts (48 GB+ or dedicated 24 GB+ VRAM) |
+| `gemma4:latest` | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking` | Fallback only — prefer `gemma4-32k:latest` for explicit 32K `num_ctx` |
