@@ -49,9 +49,11 @@ else:
 
 SERVER_NAME = "ollama-worker"
 SERVER_INSTRUCTIONS = (
-    "Local Ollama coding delegation worker. Use list_local_ollama_models to "
-    "inspect installed models and delegate_coding_task with a self-contained "
-    "Radical Spec."
+    "Local Ollama coding delegation worker. Use list_local_ollama_models or "
+    "get_worker_scaling_profile to inspect installed models and host limits, "
+    "delegate_coding_task for short micro-specs, or start_coding_task + "
+    "check_coding_task + cancel_coding_task for longer tasks that may exceed "
+    "the 3-minute MCP call timeout."
 )
 
 
@@ -102,7 +104,7 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
             spec: Complete, self-contained Radical Spec (objective, file scope,
                 contracts, ordered steps, and verification command).
             workspace_path: Absolute path to the target project workspace directory.
-            model: Local Ollama model tag (e.g. 'gemma4-32k:latest', 'qwen2.5-coder:7b').
+            model: Local Ollama model tag (e.g. 'gemma4-32k:latest', 'qwen3:8b').
                 Leave empty to use the worker default.
             base_url: Local OpenAI-compatible Ollama endpoint URL. Leave empty to use
                 the worker default.
@@ -113,6 +115,37 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
             model=model,
             base_url=base_url,
         )
+
+    @mcp_server.tool()
+    async def start_coding_task(
+        spec: str,
+        workspace_path: str,
+        model: str = "",
+        base_url: str = "",
+    ) -> str:
+        """Start an asynchronous coding task in the background and return a job_id immediately."""
+        return await worker_core.start_coding_task(
+            spec=spec,
+            workspace_path=workspace_path,
+            model=model,
+            base_url=base_url,
+        )
+
+    @mcp_server.tool()
+    async def check_coding_task(
+        job_id: str,
+        wait_seconds: int = 0,
+    ) -> str:
+        """Check status or await completion (up to 60s per poll) of an async coding job."""
+        return await worker_core.check_coding_task(
+            job_id=job_id,
+            wait_seconds=wait_seconds,
+        )
+
+    @mcp_server.tool()
+    async def cancel_coding_task(job_id: str) -> str:
+        """Cancel a queued or running asynchronous coding job."""
+        return await worker_core.cancel_coding_task(job_id=job_id)
 
     @mcp_server.resource(
         "ollama://models",

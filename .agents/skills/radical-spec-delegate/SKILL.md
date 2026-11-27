@@ -34,13 +34,14 @@ Act strictly as **Principal Architect & Diff Reviewer**. Preserve cloud model qu
    - **Concise Return Format:** Ask for a brief summary of files changed, commands run, and verification output.
 
 4. **Invoke the Local Worker:**
-   Call `ollama-worker:delegate_coding_task` with:
-   - `spec`: The complete Radical Spec.
-   - `workspace_path`: Absolute path to the target repository/workspace.
-   - `model`: Chosen local Ollama model tag.
+   - **Short micro-specs (`<= 4` turns / fast models like `qwen3:8b`):** Call `ollama-worker:delegate_coding_task` with `spec`, `workspace_path`, and `model`.
+   - **Longer specs or slower reasoning models (e.g., `gemma4-32k:latest` on base M1):** Use the timeout-proof async job workflow so MCP's 3-minute call ceiling never cancels an active run:
+     1. Call `ollama-worker:start_coding_task` (`spec`, `workspace_path`, `model`) to receive a `job_id` immediately.
+     2. Poll `ollama-worker:check_coding_task(job_id=..., wait_seconds=30)` until `status=completed` (or `tool_call_error` / `error`).
+     3. Call `ollama-worker:cancel_coding_task(job_id=...)` if you need to abort early.
 
 5. **Verify via Diff, Not Full File Reads:**
-   Inspect `git status` and `git diff` (plus run the verification command if needed) rather than re-reading entire modified files in the cloud. If fixes are needed, send a concise, targeted follow-up Radical Spec back to `ollama-worker:delegate_coding_task`.
+   Inspect `git status` and `git diff` (plus run the verification command if needed) rather than re-reading entire modified files in the cloud. If fixes are needed, send a concise, targeted follow-up Radical Spec back to `ollama-worker`.
 
 ## If `ollama-worker` or Ollama Is Not Active
 
@@ -50,16 +51,17 @@ Act strictly as **Principal Architect & Diff Reviewer**. Preserve cloud model qu
 ## Dynamic Host Scaling & Parallel Subagents
 
 - **Inspect host capacity first:** Call `ollama-worker:list_local_ollama_models` or `ollama-worker:get_worker_scaling_profile` to view the detected host tier, effective cores/memory, `max_parallel_workers`, recommended single vs. parallel models, and any active warnings.
-- **Keep Radical Specs compact (`<= 4` tool turns / 1–3 files):** `delegate_coding_task` runs over MCP with a ~3-minute call timeout. Break large multi-module tasks into focused micro-specs so single-worker `gemma4-32k:latest` completes well inside the timeout window.
-- **16 GB hosts default to single-worker (`max_parallel_workers=1`):** `gemma4-32k:latest` (`~9.0 GB`) stays `100% GPU` with reliable native OpenAI `tool_calls`. Avoid `qwen2.5-coder:7b` for agentic delegation — it frequently dumps raw JSON tool calls as plain text without executing tools.
+- **Keep Radical Specs compact (`<= 4` tool turns / 1–3 files):** Synchronous `delegate_coding_task` runs over MCP with a ~3-minute call timeout. Use `start_coding_task` + `check_coding_task` for larger specs or slower reasoning models like `gemma4-32k:latest`.
+- **16 GB hosts default to single-worker (`max_parallel_workers=1`):** `gemma4-32k:latest` (`~9.0 GB`) and `qwen3:8b` (`~5.2 GB`) support reliable native OpenAI `tool_calls`. Avoid `qwen2.5-coder:7b` for agentic delegation — it frequently dumps raw JSON tool calls as plain text without executing tools.
 - **Opting into 2x parallel on `<= 16 GB`:** Because `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache, only enable `--max-parallel 2` with a `<= 5 GB` native tool-calling model (e.g., `qwen3:4b` or `gemma4:e4b`) and keep all concurrent workers on the **same** model tag (`OLLAMA_MAX_LOADED_MODELS=1`) to prevent weight thrashing or swap spill.
-- **Isolate parallel edits:** Never run two parallel `delegate_coding_task` calls against overlapping files in the same workspace. Assign strictly disjoint file scopes or separate `git worktree` paths (the worker slot gate emits a collision warning when concurrent tasks share a workspace).
+- **Isolate parallel edits:** Never run two parallel coding tasks against overlapping files in the same workspace. Assign strictly disjoint file scopes or separate `git worktree` paths (the worker slot gate emits a collision warning when concurrent tasks share a workspace).
 - **Host overrides:** Tune or cap host scaling without editing code via `OLLAMA_WORKER_MAX_PARALLEL`, `OLLAMA_WORKER_MAX_CORES`, `OLLAMA_WORKER_MEMORY_GB`, `OLLAMA_WORKER_CONTEXT_LENGTH`, `OLLAMA_WORKER_MODEL`, and `OLLAMA_WORKER_PARALLEL_MODEL` (or `./install_plugin.sh --max-cores <N> --max-parallel <N> --tune-ollama`).
-- **Tool-calling required:** `delegate_coding_task` runs an agentic tool loop, so only select models with reliable structured `tool_calls` support. Never pass embedding models (`nomic-embed-text`, `bge-m3`, `all-minilm`) or completion-only models (`gemma2:9b`).
+- **Tool-calling required:** Agentic delegation requires reliable structured `tool_calls` support. Never pass embedding models (`nomic-embed-text`, `bge-m3`, `all-minilm`) or completion-only models (`gemma2:9b`).
 
 | Model Tag | Size / Quant | Capabilities | Best For |
 | :--- | :--- | :--- | :--- |
-| `gemma4-32k:latest` *(default)* | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Reliable native tool calling for focused micro-specs (or 2 parallel on 24 GB+ hosts) |
+| `gemma4-32k:latest` *(default)* | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Complex multi-file reasoning (prefer `start_coding_task` + `check_coding_task` on base M1) |
+| `qwen3:8b` *(fast M1 tool-caller)* | `~5.2 GB` (`8.2B Q4_K_M`) | `tools`, `thinking` | Fast native tool-calling micro-specs on 16 GB machines well under 3m0s |
 | `qwen3:4b` / `gemma4:e4b` *(<=16 GB parallel)* | `~2.5–4.5 GB` | `tools`, `thinking` | Small native tool-calling models if opting into `--max-parallel 2` on <=16 GB hosts |
 | `llama3.1:8b-instruct-q8_0` | `7.95 GB` (`8.0B Q8_0`) | `tools` | Strict schema/formatting adherence and instruction-following |
 | `qwen2.5-coder:14b` *(24–48 GB+ hosts)* | `~9–10 GB` (`14B Q4_K_M`) | `tools` | High-memory hosts (48 GB+ or dedicated 24 GB+ VRAM) |

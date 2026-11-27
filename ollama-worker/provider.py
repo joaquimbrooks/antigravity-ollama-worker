@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import urllib.error
 import urllib.request
-from typing import Any
+import uuid
+from typing import Any, Callable
 
 from google.antigravity import Agent, LocalOpenAIAgentConfig
 
@@ -95,6 +97,8 @@ class OllamaWorkerCore:
         self.ollama_tags_url = (
             ollama_tags_url or os.environ.get("OLLAMA_TAGS_URL") or OLLAMA_TAGS_URL
         )
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._job_tasks: dict[str, asyncio.Task[None]] = {}
 
     def fetch_ollama_tags(self) -> dict[str, Any]:
         """Query the local Ollama /api/tags endpoint and return parsed JSON."""
@@ -146,6 +150,147 @@ class OllamaWorkerCore:
         lines.append(self.scaling_profile.format_summary())
         return "\n".join(lines)
 
+    @staticmethod
+    def _validate_delegation_args(spec: str, workspace_path: str) -> str | None:
+        if not spec or not spec.strip():
+            return "Error: 'spec' must be a non-empty Radical Spec."
+        if not workspace_path or not os.path.isabs(workspace_path):
+            return (
+                f"Error: 'workspace_path' must be an absolute directory path, "
+                f"got: {workspace_path!r}"
+            )
+        if not os.path.isdir(workspace_path):
+            return (
+                f"Error: workspace_path does not exist or is not a directory: "
+                f"{workspace_path}"
+            )
+        return None
+
+    async def _execute_agent(
+        self,
+        config: Any,
+        spec: str,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> tuple[str, str, str]:
+        """Run LocalOpenAIAgentConfig Agent loop and return (status, error_detail, partial_output)."""
+        output_chunks: list[str] = []
+        status = "completed"
+        error_detail = ""
+        try:
+            async with Agent(config) as agent:
+                response = await agent.chat(spec)
+                async for token in response:
+                    output_chunks.append(token)
+                    if on_chunk is not None:
+                        on_chunk(token)
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error_detail = "Task was cancelled before completion."
+        except Exception as exc:  # noqa: BLE001
+            status = "error"
+            error_detail = f"{type(exc).__name__}: {exc}"
+        finally:
+            partial_output = "".join(output_chunks).strip()
+        return status, error_detail, partial_output
+
+    async def _run_delegation(
+        self,
+        spec: str,
+        workspace_path: str,
+        resolved_model: str,
+        resolved_base_url: str,
+        job: dict[str, Any] | None = None,
+    ) -> str:
+        config = LocalOpenAIAgentConfig(
+            model=resolved_model,
+            base_url=resolved_base_url,
+            workspaces=[workspace_path],
+            policies=build_worker_policies(),
+        ).lightweight()
+
+        runtime_warnings: list[str] = []
+        started = time.monotonic()
+
+        def _on_chunk(token: str) -> None:
+            if job is not None:
+                job["chunks_received"] += 1
+                job["partial_output"] = (job["partial_output"] + token)[-1000:]
+                job["elapsed_seconds"] = round(time.monotonic() - started, 2)
+
+        try:
+            async with self.slot_gate.acquire(workspace_path=workspace_path) as lease:
+                if job is not None:
+                    job["status"] = "running"
+                if lease.workspace_collision:
+                    runtime_warnings.append(
+                        "[WARNING] Another concurrent ollama-worker task is active in the same "
+                        "workspace; use disjoint file scopes or separate git worktrees to avoid "
+                        "overlapping edits."
+                    )
+                if (
+                    lease.active_slots > 1
+                    and self.scaling_profile.effective_memory_gb <= 18.0
+                    and any(
+                        marker in resolved_model.lower()
+                        for marker in ("gemma4", "14b", "32b", "36b")
+                    )
+                ):
+                    runtime_warnings.append(
+                        f"[WARNING] {lease.active_slots} concurrent workers detected on a "
+                        f"{self.scaling_profile.effective_memory_gb:.1f} GB host using {resolved_model}; "
+                        f"prefer {self.scaling_profile.recommended_parallel_model} for parallel "
+                        "subagents to stay 100% GPU without swap/KV-cache spill."
+                    )
+
+                status, error_detail, partial_output = await self._execute_agent(
+                    config, spec, on_chunk=_on_chunk if job is not None else None
+                )
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error_detail = "Task was cancelled before completion."
+            partial_output = job.get("partial_output", "").strip() if job else ""
+
+        warning_block = ("\n" + "\n".join(runtime_warnings) + "\n") if runtime_warnings else ""
+
+        if status == "completed" and _looks_like_raw_tool_call(partial_output):
+            status = "tool_call_error"
+            error_detail = (
+                f"Model {resolved_model!r} emitted a raw JSON tool call as plain text instead of "
+                "structured tool_calls; no tools were executed. Retry with a reliable native "
+                "tool-calling model (e.g. 'gemma4-32k:latest' or 'qwen3:8b')."
+            )
+
+        if status == "completed":
+            body = partial_output or "(No text output returned by local worker.)"
+            rendered = (
+                f"[ollama-worker | model={resolved_model} | workspace={workspace_path}]\n"
+                f"{warning_block}\n"
+                f"{body}\n\n"
+                "---\n"
+                "Next step: Inspect `git diff` and `git status` in the workspace to verify "
+                "all local changes before accepting."
+            )
+        else:
+            lines = [
+                f"[ollama-worker | status={status} | model={resolved_model} | workspace={workspace_path}]",
+            ]
+            if runtime_warnings:
+                lines.extend(runtime_warnings)
+            lines.append(f"Diagnostic: {error_detail}")
+            if partial_output:
+                lines.append(f"\nPartial output before {status}:\n{partial_output}")
+            lines.append(
+                "\nNext step: Inspect `git diff` / `git status` if the worker made partial edits."
+            )
+            rendered = "\n".join(lines)
+
+        if job is not None:
+            job["status"] = status
+            job["elapsed_seconds"] = round(time.monotonic() - started, 2)
+            job["result"] = rendered
+
+        return rendered
+
     async def delegate_coding_task(
         self,
         spec: str,
@@ -158,108 +303,121 @@ class OllamaWorkerCore:
         Args:
         spec: Complete, self-contained Radical Spec (objective, file scope, contracts, ordered steps, and verification command).
         workspace_path: Absolute path to the target project workspace directory.
-        model: Local Ollama model tag (e.g. 'gemma4-32k:latest', 'qwen2.5-coder:7b'). Leave empty to use provider default.
+        model: Local Ollama model tag (e.g. 'gemma4-32k:latest', 'qwen3:8b'). Leave empty to use provider default.
         base_url: Local OpenAI-compatible Ollama endpoint URL. Leave empty to use provider default.
         """
-        if not spec or not spec.strip():
-            return "Error: 'spec' must be a non-empty Radical Spec."
-
-        if not workspace_path or not os.path.isabs(workspace_path):
-            return (
-                f"Error: 'workspace_path' must be an absolute directory path, "
-                f"got: {workspace_path!r}"
-            )
-
-        if not os.path.isdir(workspace_path):
-            return (
-                f"Error: workspace_path does not exist or is not a directory: "
-                f"{workspace_path}"
-            )
+        err = self._validate_delegation_args(spec, workspace_path)
+        if err is not None:
+            return err
 
         resolved_model = (model or "").strip() or self.default_model
         resolved_base_url = (base_url or "").strip() or self.default_base_url
-
-        config = LocalOpenAIAgentConfig(
-            model=resolved_model,
-            base_url=resolved_base_url,
-            workspaces=[workspace_path],
-            policies=build_worker_policies(),
-        ).lightweight()
-
-        output_chunks: list[str] = []
-        status = "completed"
-        error_detail = ""
-        runtime_warnings: list[str] = []
-
-        async with self.slot_gate.acquire(workspace_path=workspace_path) as lease:
-            if lease.workspace_collision:
-                runtime_warnings.append(
-                    "[WARNING] Another concurrent ollama-worker task is active in the same "
-                    "workspace; use disjoint file scopes or separate git worktrees to avoid "
-                    "overlapping edits."
-                )
-            if (
-                lease.active_slots > 1
-                and self.scaling_profile.effective_memory_gb <= 18.0
-                and any(
-                    marker in resolved_model.lower()
-                    for marker in ("gemma4", "14b", "32b", "36b")
-                )
-            ):
-                runtime_warnings.append(
-                    f"[WARNING] {lease.active_slots} concurrent workers detected on a "
-                    f"{self.scaling_profile.effective_memory_gb:.1f} GB host using {resolved_model}; "
-                    f"prefer {self.scaling_profile.recommended_parallel_model} for parallel "
-                    "subagents to stay 100% GPU without swap/KV-cache spill."
-                )
-
-            try:
-                async with Agent(config) as agent:
-                    response = await agent.chat(spec)
-                    async for token in response:
-                        output_chunks.append(token)
-            except asyncio.CancelledError:
-                status = "cancelled"
-                error_detail = "Task was cancelled before completion."
-            except Exception as exc:  # noqa: BLE001
-                status = "error"
-                error_detail = f"{type(exc).__name__}: {exc}"
-            finally:
-                partial_output = "".join(output_chunks).strip()
-
-        warning_block = ("\n" + "\n".join(runtime_warnings) + "\n") if runtime_warnings else ""
-
-        if status == "completed" and _looks_like_raw_tool_call(partial_output):
-            status = "tool_call_error"
-            error_detail = (
-                f"Model {resolved_model!r} emitted a raw JSON tool call as plain text instead of "
-                "structured tool_calls; no tools were executed. Retry with a reliable native "
-                "tool-calling model (e.g. 'gemma4-32k:latest')."
-            )
-
-        if status == "completed":
-            body = partial_output or "(No text output returned by local worker.)"
-            return (
-                f"[ollama-worker | model={resolved_model} | workspace={workspace_path}]\n"
-                f"{warning_block}\n"
-                f"{body}\n\n"
-                "---\n"
-                "Next step: Inspect `git diff` and `git status` in the workspace to verify "
-                "all local changes before accepting."
-            )
-
-        lines = [
-            f"[ollama-worker | status={status} | model={resolved_model} | workspace={workspace_path}]",
-        ]
-        if runtime_warnings:
-            lines.extend(runtime_warnings)
-        lines.append(f"Diagnostic: {error_detail}")
-        if partial_output:
-            lines.append(f"\nPartial output before {status}:\n{partial_output}")
-        lines.append(
-            "\nNext step: Inspect `git diff` / `git status` if the worker made partial edits."
+        return await self._run_delegation(
+            spec=spec,
+            workspace_path=workspace_path,
+            resolved_model=resolved_model,
+            resolved_base_url=resolved_base_url,
         )
+
+    async def start_coding_task(
+        self,
+        spec: str,
+        workspace_path: str,
+        model: str = "",
+        base_url: str = "",
+    ) -> str:
+        """Start an asynchronous coding task in the background and return a job_id immediately."""
+        err = self._validate_delegation_args(spec, workspace_path)
+        if err is not None:
+            return err
+
+        resolved_model = (model or "").strip() or self.default_model
+        resolved_base_url = (base_url or "").strip() or self.default_base_url
+        job_id = uuid.uuid4().hex[:10]
+        job: dict[str, Any] = {
+            "job_id": job_id,
+            "status": "queued",
+            "model": resolved_model,
+            "workspace_path": workspace_path,
+            "started_at": time.monotonic(),
+            "elapsed_seconds": 0.0,
+            "chunks_received": 0,
+            "partial_output": "",
+            "result": "",
+        }
+        self._jobs[job_id] = job
+
+        async def _runner() -> None:
+            await self._run_delegation(
+                spec=spec,
+                workspace_path=workspace_path,
+                resolved_model=resolved_model,
+                resolved_base_url=resolved_base_url,
+                job=job,
+            )
+
+        self._job_tasks[job_id] = asyncio.create_task(_runner())
+        return (
+            f"[ollama-worker | job_id={job_id} | status=queued | model={resolved_model} | "
+            f"workspace={workspace_path}]\n"
+            f"Task started asynchronously. Poll `check_coding_task(job_id={job_id!r}, "
+            "wait_seconds=30)` until completion, or `cancel_coding_task` to abort."
+        )
+
+    async def check_coding_task(self, job_id: str, wait_seconds: int = 0) -> str:
+        """Check status or await completion (up to 60s per poll) of an async coding job."""
+        cleaned_id = (job_id or "").strip()
+        job = self._jobs.get(cleaned_id)
+        if job is None:
+            known = ", ".join(sorted(self._jobs.keys())) or "none"
+            return f"Error: Unknown job_id {job_id!r}. Known jobs: {known}."
+
+        task = self._job_tasks.get(cleaned_id)
+        clamped_wait = max(0, min(60, int(wait_seconds)))
+        if clamped_wait > 0 and task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=float(clamped_wait))
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        elapsed = round(time.monotonic() - float(job["started_at"]), 2)
+        if job["status"] not in {"queued", "running"} and job["result"]:
+            return (
+                f"[ollama-worker | job_id={cleaned_id} | status={job['status']} | "
+                f"elapsed={job['elapsed_seconds']}s]\n\n{job['result']}"
+            )
+
+        tail = (job.get("partial_output") or "").strip()[-500:]
+        lines = [
+            f"[ollama-worker | job_id={cleaned_id} | status={job['status']} | "
+            f"model={job['model']} | elapsed={elapsed}s | chunks={job['chunks_received']}]",
+            "Task is still in progress. Call `check_coding_task` again with `wait_seconds=30`.",
+        ]
+        if tail:
+            lines.append(f"\nRecent output tail:\n{tail}")
         return "\n".join(lines)
+
+    async def cancel_coding_task(self, job_id: str) -> str:
+        """Cancel a queued or running asynchronous coding job."""
+        cleaned_id = (job_id or "").strip()
+        job = self._jobs.get(cleaned_id)
+        if job is None:
+            return f"Error: Unknown job_id {job_id!r}."
+
+        task = self._job_tasks.get(cleaned_id)
+        if task is None or task.done():
+            return (
+                f"[ollama-worker | job_id={cleaned_id} | status={job['status']}] "
+                "Job already finished; nothing to cancel."
+            )
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        job["status"] = "cancelled"
+        return f"[ollama-worker | job_id={cleaned_id} | status=cancelled] Job cancelled."
 
     def models_snapshot_json(self) -> str:
         """Return installed Ollama models (or connection diagnostic) serialized as JSON."""
@@ -369,6 +527,48 @@ if HAS_MCP_HARNESS:
                 model=model,
                 base_url=base_url,
             )
+
+        @tool(
+            name="start_coding_task",
+            description="Start an asynchronous coding task in the background and return a job_id immediately.",
+        )
+        async def start_coding_task(
+            self,
+            spec: str,
+            workspace_path: str,
+            model: str = "",
+            base_url: str = "",
+        ) -> str:
+            """Start an asynchronous coding task in the background and return a job_id immediately."""
+            return await self.core.start_coding_task(
+                spec=spec,
+                workspace_path=workspace_path,
+                model=model,
+                base_url=base_url,
+            )
+
+        @tool(
+            name="check_coding_task",
+            description="Check status or await completion (up to 60s per poll) of an async coding job.",
+        )
+        async def check_coding_task(
+            self,
+            job_id: str,
+            wait_seconds: int = 0,
+        ) -> str:
+            """Check status or await completion (up to 60s per poll) of an async coding job."""
+            return await self.core.check_coding_task(
+                job_id=job_id,
+                wait_seconds=wait_seconds,
+            )
+
+        @tool(
+            name="cancel_coding_task",
+            description="Cancel a queued or running asynchronous coding job.",
+        )
+        async def cancel_coding_task(self, job_id: str) -> str:
+            """Cancel a queued or running asynchronous coding job."""
+            return await self.core.cancel_coding_task(job_id=job_id)
 
         @resource(
             uri_pattern="ollama://models",

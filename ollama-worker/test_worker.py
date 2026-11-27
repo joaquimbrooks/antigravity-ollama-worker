@@ -29,11 +29,15 @@ async def verify_mcpserver_fallback() -> bool:
     mcp_srv = server.create_mcpserver_fallback()
 
     tools = {t.name: t for t in await mcp_srv.list_tools()}
-    if (
-        "list_local_ollama_models" not in tools
-        or "delegate_coding_task" not in tools
-        or "get_worker_scaling_profile" not in tools
-    ):
+    expected_tools = {
+        "list_local_ollama_models",
+        "get_worker_scaling_profile",
+        "delegate_coding_task",
+        "start_coding_task",
+        "check_coding_task",
+        "cancel_coding_task",
+    }
+    if not expected_tools.issubset(tools.keys()):
         print(f"[FAIL] Missing expected tools in MCPServer fallback: {list(tools.keys())}")
         return False
 
@@ -113,11 +117,15 @@ async def verify_provider_and_protocol() -> bool:
     )
     tools_resp = json.loads(tools_raw or "{}")
     tools = {t["name"]: t for t in tools_resp.get("result", {}).get("tools", [])}
-    if (
-        "list_local_ollama_models" not in tools
-        or "delegate_coding_task" not in tools
-        or "get_worker_scaling_profile" not in tools
-    ):
+    expected_tools = {
+        "list_local_ollama_models",
+        "get_worker_scaling_profile",
+        "delegate_coding_task",
+        "start_coding_task",
+        "check_coding_task",
+        "cancel_coding_task",
+    }
+    if not expected_tools.issubset(tools.keys()):
         print(f"[FAIL] Missing expected tools in tools/list: {list(tools.keys())}")
         return False
 
@@ -541,6 +549,67 @@ async def verify_hardware_and_scaling() -> bool:
     return True
 
 
+async def verify_async_job_lifecycle() -> bool:
+    """Verify start_coding_task, check_coding_task, and cancel_coding_task with mocked agent execution."""
+    import hardware
+    import provider
+
+    with tempfile.TemporaryDirectory(prefix="ollama_async_jobs_") as tmpdir:
+        core = provider.OllamaWorkerCore()
+        core.slot_gate = hardware.WorkerSlotGate(
+            max_slots=1, lock_dir=Path(tmpdir) / "locks"
+        )
+
+        bad_start = await core.start_coding_task("Test spec", "relative/path")
+        if "must be an absolute directory path" not in bad_start:
+            print(f"[FAIL] Unexpected start_coding_task validation output: {bad_start}")
+            return False
+
+        gate_started = asyncio.Event()
+        release_agent = asyncio.Event()
+
+        async def _fake_execute(config, spec, on_chunk=None):  # noqa: ANN001
+            gate_started.set()
+            if on_chunk is not None:
+                on_chunk("working...")
+            await release_agent.wait()
+            return "completed", "", "All tests passed."
+
+        core._execute_agent = _fake_execute  # type: ignore[method-assign]
+
+        start_msg = await core.start_coding_task("Implement X", tmpdir, model="qwen3:8b")
+        if "job_id=" not in start_msg or "status=queued" not in start_msg:
+            print(f"[FAIL] Unexpected start_coding_task output: {start_msg}")
+            return False
+        job_id = start_msg.split("job_id=", 1)[1].split(" ", 1)[0]
+
+        await asyncio.wait_for(gate_started.wait(), timeout=2.0)
+        mid_check = await core.check_coding_task(job_id, wait_seconds=0)
+        if "status=running" not in mid_check or "working..." not in mid_check:
+            print(f"[FAIL] Unexpected mid-run check_coding_task output: {mid_check}")
+            return False
+
+        release_agent.set()
+        done_check = await core.check_coding_task(job_id, wait_seconds=5)
+        if "status=completed" not in done_check or "All tests passed." not in done_check:
+            print(f"[FAIL] Unexpected completed check_coding_task output: {done_check}")
+            return False
+
+        # Test cancellation on a second blocked job
+        gate_started.clear()
+        release_agent.clear()
+        start_msg_2 = await core.start_coding_task("Long task", tmpdir, model="qwen3:8b")
+        job_id_2 = start_msg_2.split("job_id=", 1)[1].split(" ", 1)[0]
+        await asyncio.wait_for(gate_started.wait(), timeout=2.0)
+        cancel_msg = await core.cancel_coding_task(job_id_2)
+        if "status=cancelled" not in cancel_msg:
+            print(f"[FAIL] Unexpected cancel_coding_task output: {cancel_msg}")
+            return False
+
+    print("[PASS] Async job lifecycle (start, poll/wait, complete, cancel) verified.")
+    return True
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test ollama-worker.")
     parser.add_argument(
@@ -571,6 +640,9 @@ async def main() -> int:
         return 1
 
     if not await verify_hardware_and_scaling():
+        return 1
+
+    if not await verify_async_job_lifecycle():
         return 1
 
     if args.offline_only:
