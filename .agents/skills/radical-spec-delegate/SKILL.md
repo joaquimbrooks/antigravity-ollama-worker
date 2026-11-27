@@ -50,16 +50,18 @@ Act strictly as **Principal Architect & Diff Reviewer**. Preserve cloud model qu
 ## Dynamic Host Scaling & Parallel Subagents
 
 - **Inspect host capacity first:** Call `ollama-worker:list_local_ollama_models` or `ollama-worker:get_worker_scaling_profile` to view the detected host tier, effective cores/memory, `max_parallel_workers`, recommended single vs. parallel models, and any active warnings.
-- **KV cache multiplies with `OLLAMA_NUM_PARALLEL`:** On **<= 16 GB** unified-memory / VRAM machines, running 2 parallel slots allocates `2x` KV cache alongside model weights. Use `gemma4-32k:latest` (`~9.0 GB`) for **single-worker** tasks, and switch to `qwen2.5-coder:7b` (`~4.4 GB`) when fanning out **2 parallel subagents** so both slots stay `100% GPU` without CPU/swap spill.
-- **Avoid model thrashing (`OLLAMA_MAX_LOADED_MODELS=1`):** When running parallel subagents on compact hosts, keep all concurrent workers on the **same** model tag (`qwen2.5-coder:7b`). Mixing models forces Ollama to repeatedly evict and reload multi-GB weights.
+- **Keep Radical Specs compact (`<= 4` tool turns / 1–3 files):** `delegate_coding_task` runs over MCP with a ~3-minute call timeout. Break large multi-module tasks into focused micro-specs so single-worker `gemma4-32k:latest` completes well inside the timeout window.
+- **16 GB hosts default to single-worker (`max_parallel_workers=1`):** `gemma4-32k:latest` (`~9.0 GB`) stays `100% GPU` with reliable native OpenAI `tool_calls`. Avoid `qwen2.5-coder:7b` for agentic delegation — it frequently dumps raw JSON tool calls as plain text without executing tools.
+- **Opting into 2x parallel on `<= 16 GB`:** Because `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache, only enable `--max-parallel 2` with a `<= 5 GB` native tool-calling model (e.g., `qwen3:4b` or `gemma4:e4b`) and keep all concurrent workers on the **same** model tag (`OLLAMA_MAX_LOADED_MODELS=1`) to prevent weight thrashing or swap spill.
 - **Isolate parallel edits:** Never run two parallel `delegate_coding_task` calls against overlapping files in the same workspace. Assign strictly disjoint file scopes or separate `git worktree` paths (the worker slot gate emits a collision warning when concurrent tasks share a workspace).
 - **Host overrides:** Tune or cap host scaling without editing code via `OLLAMA_WORKER_MAX_PARALLEL`, `OLLAMA_WORKER_MAX_CORES`, `OLLAMA_WORKER_MEMORY_GB`, `OLLAMA_WORKER_CONTEXT_LENGTH`, `OLLAMA_WORKER_MODEL`, and `OLLAMA_WORKER_PARALLEL_MODEL` (or `./install_plugin.sh --max-cores <N> --max-parallel <N> --tune-ollama`).
-- **Tool-calling required:** `delegate_coding_task` runs an agentic tool loop, so only select models with `tools` capability. Never pass embedding models (`nomic-embed-text`, `bge-m3`, `all-minilm`) or completion-only models (`gemma2:9b`).
+- **Tool-calling required:** `delegate_coding_task` runs an agentic tool loop, so only select models with reliable structured `tool_calls` support. Never pass embedding models (`nomic-embed-text`, `bge-m3`, `all-minilm`) or completion-only models (`gemma2:9b`).
 
 | Model Tag | Size / Quant | Capabilities | Best For |
 | :--- | :--- | :--- | :--- |
-| `gemma4-32k:latest` *(single-worker default)* | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Single-worker multi-file features, refactors, larger Radical Specs (or 2 parallel on 24 GB+ hosts) |
-| `qwen2.5-coder:7b` *(<=16 GB parallel default)* | `4.36 GB` (`7.6B Q4_K_M`) | `tools` | 2 concurrent subagents on <=16 GB hosts, fast single-file edits, unit tests, `pytest`/`ruff` loops |
+| `gemma4-32k:latest` *(default)* | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking`, `num_ctx=32768` | Reliable native tool calling for focused micro-specs (or 2 parallel on 24 GB+ hosts) |
+| `qwen3:4b` / `gemma4:e4b` *(<=16 GB parallel)* | `~2.5–4.5 GB` | `tools`, `thinking` | Small native tool-calling models if opting into `--max-parallel 2` on <=16 GB hosts |
 | `llama3.1:8b-instruct-q8_0` | `7.95 GB` (`8.0B Q8_0`) | `tools` | Strict schema/formatting adherence and instruction-following |
 | `qwen2.5-coder:14b` *(24–48 GB+ hosts)* | `~9–10 GB` (`14B Q4_K_M`) | `tools` | High-memory hosts (48 GB+ or dedicated 24 GB+ VRAM) |
+| `qwen2.5-coder:7b` *(avoid for agent loops)* | `4.36 GB` (`7.6B Q4_K_M`) | `tools` *(flaky JSON)* | Single-turn completion only — frequently emits raw JSON text instead of `tool_calls` |
 | `gemma4:latest` | `8.95 GB` (`8.0B Q4_K_M`) | `tools`, `thinking` | Fallback only — prefer `gemma4-32k:latest` for explicit 32K `num_ctx` |

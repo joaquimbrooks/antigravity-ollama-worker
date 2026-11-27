@@ -337,11 +337,11 @@ def build_scaling_profile(
 
     if effective_memory_gb <= 18.0:
         tier = "compact-<=16gb"
-        default_parallel = 2 if effective_cores >= 2 else 1
+        default_parallel = 1
         max_loaded = 1
         ctx = 32768
         single_model = "gemma4-32k:latest"
-        parallel_model = "qwen2.5-coder:7b"
+        parallel_model = "qwen3:4b"
     elif effective_memory_gb < 44.0:
         tier = "mid-24gb-36gb"
         default_parallel = 2 if effective_cores >= 2 else 1
@@ -377,11 +377,20 @@ def build_scaling_profile(
         parallel_model = raw_parallel_model
         overrides_applied["OLLAMA_WORKER_PARALLEL_MODEL"] = raw_parallel_model
 
+    if single_model.lower().startswith("qwen2.5-coder") or parallel_model.lower().startswith(
+        "qwen2.5-coder"
+    ):
+        warnings.append(
+            "qwen2.5-coder frequently emits raw JSON text instead of structured OpenAI tool_calls "
+            "under LocalOpenAIAgentConfig (causing no-op tool runs); prefer gemma4-32k:latest for "
+            "reliable tool calling or qwen3:4b / gemma4:e4b for small parallel slots."
+        )
+
     if effective_memory_gb <= 18.0 and max_parallel_workers >= 2:
         warnings.append(
             "OLLAMA_NUM_PARALLEL multiplies KV cache allocation across active slots; on <=16 GB "
-            f"hosts use a <=5 GB model (e.g. {parallel_model}) for concurrent subagents and keep "
-            "OLLAMA_MAX_LOADED_MODELS=1 to avoid CPU/swap spill and model thrashing."
+            f"hosts use a <=5 GB native tool-calling model (e.g. {parallel_model}) for concurrent "
+            "subagents and keep OLLAMA_MAX_LOADED_MODELS=1 to avoid CPU/swap spill and model thrashing."
         )
 
     if max_parallel_workers > effective_cores or (

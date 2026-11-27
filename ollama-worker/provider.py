@@ -46,6 +46,30 @@ def _format_size_gb(size_bytes: int | float | None) -> str:
     return f"{gb:.2f} GB"
 
 
+def _looks_like_raw_tool_call(text: str) -> bool:
+    """Return True if worker output is an unexecuted raw JSON tool call emitted as text."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            stripped = "\n".join(lines[1:-1]).strip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    items = parsed if isinstance(parsed, list) else [parsed]
+    return bool(items) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and "arguments" in item
+        for item in items
+    )
+
+
 class OllamaWorkerCore:
     """Framework-agnostic Ollama delegation engine shared by MCPServer and mcp-harness."""
 
@@ -204,6 +228,14 @@ class OllamaWorkerCore:
                 partial_output = "".join(output_chunks).strip()
 
         warning_block = ("\n" + "\n".join(runtime_warnings) + "\n") if runtime_warnings else ""
+
+        if status == "completed" and _looks_like_raw_tool_call(partial_output):
+            status = "tool_call_error"
+            error_detail = (
+                f"Model {resolved_model!r} emitted a raw JSON tool call as plain text instead of "
+                "structured tool_calls; no tools were executed. Retry with a reliable native "
+                "tool-calling model (e.g. 'gemma4-32k:latest')."
+            )
 
         if status == "completed":
             body = partial_output or "(No text output returned by local worker.)"

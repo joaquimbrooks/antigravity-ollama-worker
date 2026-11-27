@@ -15,7 +15,7 @@
 
 | Host Tier | `OLLAMA_NUM_PARALLEL` | `OLLAMA_MAX_LOADED_MODELS` | `OLLAMA_CONTEXT_LENGTH` | Single Worker Model | Parallel Subagents Model |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `compact-<=16gb` *(e.g. 16 GB M1)* | `2` *(if >=2 cores)* | `1` | `32768` | `gemma4-32k:latest` | `qwen2.5-coder:7b` |
+| `compact-<=16gb` *(e.g. 16 GB M1)* | `1` *(safe default)* | `1` | `32768` | `gemma4-32k:latest` | `qwen3:4b` *(opt-in via `--max-parallel 2`)* |
 | `mid-24gb-36gb` | `2` *(if >=2 cores)* | `1` (<30 GB) / `2` | `32768` | `gemma4-32k:latest` | `gemma4-32k:latest` |
 | `high-48gb+` | `2–4` *(min(4, cores//2))* | `2` | `65536` | `qwen2.5-coder:14b` | `gemma4-32k:latest` |
 
@@ -36,7 +36,8 @@ You can inspect your machine's detected profile anytime with `./ollama-worker/.v
 
 ### Important Scaling Warnings
 
-- **KV cache multiplies with `OLLAMA_NUM_PARALLEL`:** Setting `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache upfront. On 16 GB machines, use `<= 5 GB` models (`qwen2.5-coder:7b`) for 2 concurrent subagents; running 2 slots of a `9 GB+` model risks CPU/swap spill.
+- **16 GB default is `max_parallel_workers=1` (`gemma4-32k:latest`):** `gemma4-32k:latest` provides reliable native OpenAI `tool_calls` and stays `100% GPU` single-stream. Avoid `qwen2.5-coder:7b` for agentic loops — it frequently emits raw JSON text instead of structured `tool_calls` (flagged as `status=tool_call_error` by `provider.py`).
+- **KV cache multiplies with `OLLAMA_NUM_PARALLEL`:** Opting into `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache upfront. On 16 GB machines, use a `<= 5 GB` native tool-calling model (`qwen3:4b` or `gemma4:e4b` via `--parallel-model`) for 2 concurrent subagents; running 2 slots of a `9 GB+` model risks CPU/swap spill.
 - **Avoid model thrashing (`OLLAMA_MAX_LOADED_MODELS=1`):** On `<= 16 GB` hosts, keep concurrent subagents on the same model tag. Requesting two different models concurrently forces Ollama to evict and reload weights from disk.
 - **Daemon defaults to `OLLAMA_NUM_PARALLEL=1`:** Unless tuned and restarted, Ollama queues concurrent requests serially even when `WorkerSlotGate` allows 2 slots.
 - **Workspace write collisions:** Running parallel workers on the same `workspace_path` triggers a collision warning; give each subagent disjoint files or separate `git worktree` paths.
@@ -46,10 +47,10 @@ You can inspect your machine's detected profile anytime with `./ollama-worker/.v
 - [ ] **Recommended (dynamic per host):** Preview or apply host-tuned daemon variables with `install_plugin.sh`:
   ```zsh
   # Dry-run (prints host profile + recommended launchctl/export commands):
-  ./install_plugin.sh --max-cores 2 --max-parallel 2
+  ./install_plugin.sh
 
-  # Apply via launchctl on macOS:
-  ./install_plugin.sh --max-cores 2 --max-parallel 2 --tune-ollama
+  # Opt-in 2-slot parallel subagent tuning on 16 GB macOS (using a <=5 GB native tool-calling model):
+  ./install_plugin.sh --max-parallel 2 --parallel-model qwen3:4b --tune-ollama
   ```
 - [ ] *(Manual macOS `launchctl` example for 16 GB M1 with 2 parallel subagent slots)*:
   ```zsh
@@ -68,7 +69,7 @@ You can inspect your machine's detected profile anytime with `./ollama-worker/.v
   ```
 - [ ] Load a coding model briefly and verify `CONTEXT` (`32768`) and `100% GPU` via `ollama ps`:
   ```zsh
-  ollama run qwen2.5-coder:7b "Reply with OK"
+  ollama run gemma4-32k:latest "Reply with OK"
   ollama ps
   ```
 

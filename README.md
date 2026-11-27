@@ -87,7 +87,8 @@ If you use a custom MCP runtime implementing the `mcp-harness` interface (`mcp_h
   - `--parallel-model <tag>` / `OLLAMA_WORKER_PARALLEL_MODEL` — recommended model for concurrent subagents
   - `--tune-ollama` — apply recommended `OLLAMA_NUM_PARALLEL`, `OLLAMA_MAX_LOADED_MODELS`, `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_KV_CACHE_TYPE`, and `OLLAMA_FLASH_ATTENTION` (`launchctl` on macOS; prints exports elsewhere)
 - **Built-in Warnings:**
-  - **KV-cache multiplication:** On `<= 16 GB` hosts, running 2 parallel slots allocates `2x` KV cache — prefer `qwen2.5-coder:7b` (`~4.4 GB`) over `gemma4-32k:latest` (`~9.0 GB`) for parallel subagents and keep `OLLAMA_MAX_LOADED_MODELS=1` to avoid swap spill or model thrashing.
+  - **KV-cache multiplication:** On `<= 16 GB` hosts (which default to `max_parallel_workers=1` with `gemma4-32k:latest`), opting into `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache — use a `<= 5 GB` native tool-calling model (`qwen3:4b` or `gemma4:e4b`) and keep `OLLAMA_MAX_LOADED_MODELS=1` to avoid swap spill or model thrashing.
+  - **Raw-JSON tool-call guard:** `qwen2.5-coder:7b` frequently emits raw JSON text instead of structured `tool_calls` under `LocalOpenAIAgentConfig`; `provider.py` detects unexecuted JSON tool payloads and returns `status=tool_call_error` instead of silent false-success.
   - **Workspace collisions:** Running two concurrent `delegate_coding_task` calls in the same directory emits a collision warning; assign disjoint files or separate `git worktree` paths.
 
 ### Using with Other MCP Clients (Codex CLI, Claude Code, Cursor, etc.)

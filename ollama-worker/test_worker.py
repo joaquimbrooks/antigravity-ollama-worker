@@ -379,12 +379,28 @@ async def verify_hardware_and_scaling() -> bool:
     prof_16gb = hardware.build_scaling_profile(hardware=hw_16gb, env={})
     if (
         prof_16gb.tier != "compact-<=16gb"
-        or prof_16gb.max_parallel_workers != 2
+        or prof_16gb.max_parallel_workers != 1
         or prof_16gb.recommended_single_model != "gemma4-32k:latest"
-        or prof_16gb.recommended_parallel_model != "qwen2.5-coder:7b"
-        or not any("KV cache" in w for w in prof_16gb.warnings)
+        or prof_16gb.recommended_parallel_model != "qwen3:4b"
     ):
         print(f"[FAIL] Unexpected compact 16GB scaling profile: {prof_16gb}")
+        return False
+
+    prof_16gb_parallel = hardware.build_scaling_profile(
+        hardware=hw_16gb, env={"OLLAMA_WORKER_MAX_PARALLEL": "2"}
+    )
+    if (
+        prof_16gb_parallel.max_parallel_workers != 2
+        or not any("KV cache" in w for w in prof_16gb_parallel.warnings)
+    ):
+        print(f"[FAIL] Expected KV cache warning for 16GB parallel=2: {prof_16gb_parallel}")
+        return False
+
+    prof_qwen25 = hardware.build_scaling_profile(
+        hardware=hw_16gb, env={"OLLAMA_WORKER_MODEL": "qwen2.5-coder:7b"}
+    )
+    if not any("raw JSON text" in w for w in prof_qwen25.warnings):
+        print(f"[FAIL] Expected raw JSON tool_calls warning for qwen2.5-coder: {prof_qwen25}")
         return False
 
     hw_1core = hardware.HostHardware(
@@ -442,10 +458,27 @@ async def verify_hardware_and_scaling() -> bool:
 
     # 2. Override checks & malformed input resilience
     prof_capped = hardware.build_scaling_profile(
-        hardware=hw_16gb, env={"OLLAMA_WORKER_MAX_CORES": "1"}
+        hardware=hw_32gb, env={"OLLAMA_WORKER_MAX_CORES": "1"}
     )
     if prof_capped.max_parallel_workers != 1:
-        print(f"[FAIL] OLLAMA_WORKER_MAX_CORES=1 did not cap parallelism: {prof_capped}")
+        print(f"[FAIL] OLLAMA_WORKER_MAX_CORES=1 did not cap parallelism on 32GB host: {prof_capped}")
+        return False
+
+    # Raw JSON tool-call detector checks
+    import provider
+
+    if not provider._looks_like_raw_tool_call(
+        '{"name": "read_files", "arguments": {"files": ["pyproject.toml"]}}'
+    ):
+        print("[FAIL] _looks_like_raw_tool_call missed plain JSON tool payload.")
+        return False
+    if not provider._looks_like_raw_tool_call(
+        '```json\n{"name": "run_command", "arguments": {"CommandLine": "pytest"}}\n```'
+    ):
+        print("[FAIL] _looks_like_raw_tool_call missed fenced JSON tool payload.")
+        return False
+    if provider._looks_like_raw_tool_call("Completed edits and all tests passed."):
+        print("[FAIL] _looks_like_raw_tool_call falsely flagged normal prose.")
         return False
 
     prof_custom = hardware.build_scaling_profile(

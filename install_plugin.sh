@@ -159,8 +159,6 @@ for key, val in explicit_map.items():
     if val:
         env_map[key] = val
 
-env_map.setdefault("OLLAMA_WORKER_MAX_PARALLEL", str(profile["max_parallel_workers"]))
-
 if env_map:
     server_cfg["env"] = env_map
 
