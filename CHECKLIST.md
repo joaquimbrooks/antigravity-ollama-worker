@@ -15,7 +15,7 @@
 
 | Host Tier | `OLLAMA_NUM_PARALLEL` | `OLLAMA_MAX_LOADED_MODELS` | `OLLAMA_CONTEXT_LENGTH` | Single Worker Model | Parallel Subagents Model |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `compact-<=16gb` *(e.g. 16 GB M1)* | `1` *(safe default)* | `1` | `32768` | `gemma4-32k:latest` | `qwen3:4b` *(opt-in via `--max-parallel 2`)* |
+| `compact-<=16gb` *(e.g. 16 GB M1)* | `1` *(safe default)* | `1` | `16384` *(opt into `32768` via `--context-length 32768`)* | `gemma4-32k:latest` | `qwen3:4b` *(opt-in via `--max-parallel 2`)* |
 | `mid-24gb-36gb` | `2` *(if >=2 cores)* | `1` (<30 GB) / `2` | `32768` | `gemma4-32k:latest` | `gemma4-32k:latest` |
 | `high-48gb+` | `2–4` *(min(4, cores//2))* | `2` | `65536` | `qwen2.5-coder:14b` | `gemma4-32k:latest` |
 
@@ -36,7 +36,7 @@ You can inspect your machine's detected profile anytime with `./ollama-worker/.v
 
 ### Important Scaling Warnings
 
-- **16 GB default is `max_parallel_workers=1` (`gemma4-32k:latest`):** `gemma4-32k:latest` provides reliable native OpenAI `tool_calls` and stays `100% GPU` single-stream. Avoid `qwen2.5-coder:7b` for agentic loops — it frequently emits raw JSON text instead of structured `tool_calls` (flagged as `status=tool_call_error` by `provider.py`).
+- **16 GB default is `max_parallel_workers=1`, `OLLAMA_CONTEXT_LENGTH=16384` (`gemma4-32k:latest`):** `16384` context keeps KV-cache pressure low on 16 GB unified memory (`--context-length 32768` is opt-in). `provider.py` tracks live step telemetry (`phase`, `idle`, `thinking_chunks`, `tool_calls`, `turns`, `last_tool`), enforces idle/wall watchdogs (`idle_timeout_seconds`, `max_wall_seconds`, `disable_thinking`), force-terminates child harness processes on cancel/shutdown, and flags unexecuted raw JSON tool payloads (`"arguments"`/`"parameters"`) or leaked template tokens (`<channel|>`) as `status=tool_call_error`.
 - **KV cache multiplies with `OLLAMA_NUM_PARALLEL`:** Opting into `OLLAMA_NUM_PARALLEL=2` allocates `2x` KV cache upfront. On 16 GB machines, use a `<= 5 GB` native tool-calling model (`qwen3:4b` or `gemma4:e4b` via `--parallel-model`) for 2 concurrent subagents; running 2 slots of a `9 GB+` model risks CPU/swap spill.
 - **Avoid model thrashing (`OLLAMA_MAX_LOADED_MODELS=1`):** On `<= 16 GB` hosts, keep concurrent subagents on the same model tag. Requesting two different models concurrently forces Ollama to evict and reload weights from disk.
 - **Daemon defaults to `OLLAMA_NUM_PARALLEL=1`:** Unless tuned and restarted, Ollama queues concurrent requests serially even when `WorkerSlotGate` allows 2 slots.

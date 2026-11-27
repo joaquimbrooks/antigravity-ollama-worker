@@ -7,6 +7,7 @@ and falls back cleanly to the standard `mcp` SDK (`MCPServer`) included with
 
 from __future__ import annotations
 
+import atexit
 import logging
 import sys
 from pathlib import Path
@@ -57,7 +58,7 @@ SERVER_INSTRUCTIONS = (
 )
 
 
-def create_harness() -> Any:
+def create_harness(core: OllamaWorkerCore | None = None) -> Any:
     """Build the configured MCPHarness instance (requires optional mcp-harness)."""
     if not HAS_MCP_HARNESS or MCPHarness is None or OllamaWorkerProvider is None:
         raise ImportError(
@@ -72,7 +73,7 @@ def create_harness() -> Any:
     )
     harness_instance.use_logging(log_level=logging.WARNING)
     harness_instance.use_metrics()
-    harness_instance.register_provider(OllamaWorkerProvider())
+    harness_instance.register_provider(OllamaWorkerProvider(core=core))
     return harness_instance
 
 
@@ -97,6 +98,9 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
         workspace_path: str,
         model: str = "",
         base_url: str = "",
+        idle_timeout_seconds: int = 0,
+        max_wall_seconds: int = 0,
+        disable_thinking: bool = False,
     ) -> str:
         """Delegate a self-contained Radical Spec coding task to a local Ollama model.
 
@@ -108,12 +112,18 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
                 Leave empty to use the worker default.
             base_url: Local OpenAI-compatible Ollama endpoint URL. Leave empty to use
                 the worker default.
+            idle_timeout_seconds: Max seconds without step/chunk activity before aborting (0 = default).
+            max_wall_seconds: Max total seconds before aborting (0 = default).
+            disable_thinking: Hint to disable verbose reasoning (/no_think on qwen3).
         """
         return await worker_core.delegate_coding_task(
             spec=spec,
             workspace_path=workspace_path,
             model=model,
             base_url=base_url,
+            idle_timeout_seconds=idle_timeout_seconds,
+            max_wall_seconds=max_wall_seconds,
+            disable_thinking=disable_thinking,
         )
 
     @mcp_server.tool()
@@ -122,6 +132,9 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
         workspace_path: str,
         model: str = "",
         base_url: str = "",
+        idle_timeout_seconds: int = 0,
+        max_wall_seconds: int = 0,
+        disable_thinking: bool = False,
     ) -> str:
         """Start an asynchronous coding task in the background and return a job_id immediately."""
         return await worker_core.start_coding_task(
@@ -129,6 +142,9 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
             workspace_path=workspace_path,
             model=model,
             base_url=base_url,
+            idle_timeout_seconds=idle_timeout_seconds,
+            max_wall_seconds=max_wall_seconds,
+            disable_thinking=disable_thinking,
         )
 
     @mcp_server.tool()
@@ -179,16 +195,25 @@ def create_mcpserver_fallback(core: OllamaWorkerCore | None = None) -> MCPServer
     return mcp_server
 
 
-harness = create_harness() if HAS_MCP_HARNESS else None
-mcp = create_mcpserver_fallback()
+_shared_core = OllamaWorkerCore()
+atexit.register(_shared_core.force_kill_active_processes)
+
+harness = create_harness(core=_shared_core) if HAS_MCP_HARNESS else None
+mcp = create_mcpserver_fallback(core=_shared_core)
 
 
 def run_stdio() -> None:
     """Run STDIO MCP server via mcp-harness when installed, else MCPServer fallback."""
-    if harness is not None:
-        harness.run_stdio(log_level=logging.WARNING)
-    else:
-        mcp.run(transport="stdio")
+    try:
+        if harness is not None:
+            harness.run_stdio(
+                log_level=logging.WARNING,
+                on_shutdown=_shared_core.shutdown,
+            )
+        else:
+            mcp.run(transport="stdio")
+    finally:
+        _shared_core.force_kill_active_processes()
 
 
 if __name__ == "__main__":

@@ -388,10 +388,20 @@ async def verify_hardware_and_scaling() -> bool:
     if (
         prof_16gb.tier != "compact-<=16gb"
         or prof_16gb.max_parallel_workers != 1
+        or prof_16gb.recommended_context_length != 16384
         or prof_16gb.recommended_single_model != "gemma4-32k:latest"
         or prof_16gb.recommended_parallel_model != "qwen3:4b"
     ):
         print(f"[FAIL] Unexpected compact 16GB scaling profile: {prof_16gb}")
+        return False
+
+    prof_16gb_32k = hardware.build_scaling_profile(
+        hardware=hw_16gb, env={"OLLAMA_WORKER_CONTEXT_LENGTH": "32768"}
+    )
+    if prof_16gb_32k.recommended_context_length != 32768 or not any(
+        "16384" in w for w in prof_16gb_32k.warnings
+    ):
+        print(f"[FAIL] Expected 16GB 32K context pressure warning: {prof_16gb_32k}")
         return False
 
     prof_16gb_parallel = hardware.build_scaling_profile(
@@ -484,6 +494,21 @@ async def verify_hardware_and_scaling() -> bool:
         '```json\n{"name": "run_command", "arguments": {"CommandLine": "pytest"}}\n```'
     ):
         print("[FAIL] _looks_like_raw_tool_call missed fenced JSON tool payload.")
+        return False
+    if not provider._looks_like_raw_tool_call(
+        '{"name": "replace_file_content", "parameters": {"TargetFile": "a.py"}}'
+    ):
+        print("[FAIL] _looks_like_raw_tool_call missed Llama 3.1 'parameters' payload.")
+        return False
+    if not provider._looks_like_raw_tool_call(
+        '{"tool_calls": [{"function": {"name": "edit_file", "arguments": {}}}]}'
+    ):
+        print("[FAIL] _looks_like_raw_tool_call missed OpenAI 'tool_calls' wrapper.")
+        return False
+    if not provider._contains_raw_tool_call(
+        'Here is the edit:\n```json\n{"name": "replace_file_content", "parameters": {"TargetFile": "filter.py", "ReplacementContent": "# ..."}}\n```'
+    ):
+        print("[FAIL] _contains_raw_tool_call missed prose + fenced 'parameters' block.")
         return False
     if provider._looks_like_raw_tool_call("Completed edits and all tests passed."):
         print("[FAIL] _looks_like_raw_tool_call falsely flagged normal prose.")
@@ -610,6 +635,386 @@ async def verify_async_job_lifecycle() -> bool:
     return True
 
 
+async def verify_worker_reliability_fixes() -> bool:
+    """Verify Issues A-E fixes: raw-tool detection, step telemetry, force-abort, watchdogs, and clean exit."""
+    import signal
+    import hardware
+    import provider
+
+    with tempfile.TemporaryDirectory(prefix="ollama_reliability_") as tmpdir:
+        core = provider.OllamaWorkerCore()
+        core.slot_gate = hardware.WorkerSlotGate(
+            max_slots=1, lock_dir=Path(tmpdir) / "locks"
+        )
+
+        # --- Issue A: _run_delegation tool_call_error vs completed with real tool calls ---
+        orig_execute = core._execute_agent
+
+        async def _llama_prose_json(
+            config, spec, on_chunk=None, *, telemetry=None, **kwargs
+        ):  # noqa: ANN001, ARG001
+            if telemetry is not None:
+                telemetry["tool_calls_executed"] = 0
+            return (
+                "completed",
+                "",
+                'I will update the file:\n```json\n{"name": "replace_file_content", "parameters": {"TargetFile": "filter.py"}}\n```',
+            )
+
+        core._execute_agent = _llama_prose_json  # type: ignore[method-assign]
+        res_llama = await core._run_delegation(
+            spec="Edit filter.py",
+            workspace_path=tmpdir,
+            resolved_model="llama3.1:8b-instruct-q8_0",
+            resolved_base_url=server.DEFAULT_BASE_URL,
+        )
+        if "status=tool_call_error" not in res_llama:
+            print(f"[FAIL] Expected tool_call_error for prose+parameters with 0 tools: {res_llama}")
+            return False
+
+        async def _leaked_channel_zero_tools(
+            config, spec, on_chunk=None, *, telemetry=None, **kwargs
+        ):  # noqa: ANN001, ARG001
+            if telemetry is not None:
+                telemetry["tool_calls_executed"] = 0
+            return "completed", "", "Executing changes now.<channel|>"
+
+        core._execute_agent = _leaked_channel_zero_tools  # type: ignore[method-assign]
+        res_channel = await core._run_delegation(
+            spec="Edit filter.py",
+            workspace_path=tmpdir,
+            resolved_model="gemma4-32k:latest",
+            resolved_base_url=server.DEFAULT_BASE_URL,
+        )
+        if "status=tool_call_error" not in res_channel or "<channel|>" not in res_channel:
+            print(f"[FAIL] Expected tool_call_error for leaked <channel|>: {res_channel}")
+            return False
+
+        async def _completed_with_tools(
+            config, spec, on_chunk=None, *, telemetry=None, **kwargs
+        ):  # noqa: ANN001, ARG001
+            if telemetry is not None:
+                telemetry["tool_calls_executed"] = 2
+            return (
+                "completed",
+                "",
+                'Updated filter.py. Example payload:\n```json\n{"name": "edit_file", "parameters": {"x": 1}}\n```',
+            )
+
+        core._execute_agent = _completed_with_tools  # type: ignore[method-assign]
+        res_ok = await core._run_delegation(
+            spec="Edit filter.py",
+            workspace_path=tmpdir,
+            resolved_model="qwen3:8b",
+            resolved_base_url=server.DEFAULT_BASE_URL,
+        )
+        if "status=tool_call_error" in res_ok or "tool_calls=2" not in res_ok:
+            print(f"[FAIL] False-positive tool_call_error when tool_calls=2: {res_ok}")
+            return False
+
+        # --- Issue D: disable_thinking propagates /no_think + system_instructions ---
+        captured_specs: list[tuple[str, Any]] = []
+
+        async def _capture_config(
+            config, spec, on_chunk=None, *, telemetry=None, **kwargs
+        ):  # noqa: ANN001, ARG001
+            captured_specs.append((spec, config.system_instructions))
+            if telemetry is not None:
+                telemetry["tool_calls_executed"] = 1
+            return "completed", "", "Done."
+
+        core._execute_agent = _capture_config  # type: ignore[method-assign]
+        await core.delegate_coding_task(
+            spec="Fix bug",
+            workspace_path=tmpdir,
+            model="qwen3:8b",
+            disable_thinking=True,
+        )
+        if (
+            not captured_specs
+            or not captured_specs[0][0].startswith("/no_think\n")
+            or not captured_specs[0][1]
+        ):
+            print(f"[FAIL] disable_thinking did not propagate to spec/config: {captured_specs}")
+            return False
+
+        # Restore real _execute_agent for Agent step telemetry, abort, and idle watchdog tests
+        core._execute_agent = orig_execute  # type: ignore[method-assign]
+
+        # --- Issue B: Real-time step telemetry (thinking, tool_running, streaming) ---
+        orig_agent_cls = provider.Agent
+        tool_running_seen = asyncio.Event()
+        allow_tool_done = asyncio.Event()
+
+        class _MockConversation:
+            def __init__(self, proc=None) -> None:
+                self.cancel_called = False
+                self._connection = type(
+                    "_Conn", (), {"_process": proc, "_disconnecting": False}
+                )()
+
+            async def send(self, prompt: str) -> None:
+                pass
+
+            async def cancel(self) -> None:
+                self.cancel_called = True
+
+            async def receive_steps(self):
+                yield types.Step(
+                    id="m:0",
+                    step_index=0,
+                    trajectory_id="t1",
+                    source=types.StepSource.MODEL,
+                    type=types.StepType.THINKING,
+                    status=types.StepStatus.ACTIVE,
+                    thinking_delta="thinking step",
+                )
+                yield types.Step(
+                    id="m:1",
+                    step_index=1,
+                    trajectory_id="t1",
+                    source=types.StepSource.MODEL,
+                    type=types.StepType.TOOL_CALL,
+                    status=types.StepStatus.ACTIVE,
+                    tool_calls=[types.ToolCall(name="edit_file", id="tc-1", args={})],
+                )
+                tool_running_seen.set()
+                await allow_tool_done.wait()
+                yield types.Step(
+                    id="m:1",
+                    step_index=1,
+                    trajectory_id="t1",
+                    source=types.StepSource.MODEL,
+                    type=types.StepType.TOOL_CALL,
+                    status=types.StepStatus.DONE,
+                    tool_calls=[types.ToolCall(name="edit_file", id="tc-1", args={})],
+                )
+                yield types.Step(
+                    id="m:2",
+                    step_index=2,
+                    trajectory_id="t1",
+                    source=types.StepSource.MODEL,
+                    target=types.StepTarget.USER,
+                    type=types.StepType.TEXT_RESPONSE,
+                    status=types.StepStatus.DONE,
+                    content_delta="Edited file successfully.",
+                    is_complete_response=True,
+                )
+
+        class _TelemetryMockAgent:
+            def __init__(self, config) -> None:  # noqa: ANN001
+                self._conversation = _MockConversation()
+
+            @property
+            def conversation(self):
+                return self._conversation
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        provider.Agent = _TelemetryMockAgent  # type: ignore[misc]
+        try:
+            start_b = await core.start_coding_task("Update filter", tmpdir, model="qwen3:8b")
+            job_id_b = start_b.split("job_id=", 1)[1].split(" ", 1)[0]
+            await asyncio.wait_for(tool_running_seen.wait(), timeout=2.0)
+            mid_b = await core.check_coding_task(job_id_b, wait_seconds=0)
+            if (
+                "phase=tool_running" not in mid_b
+                or "thinking_chunks=1" not in mid_b
+                or "last_tool=edit_file" not in mid_b
+                or "turns=2" not in mid_b
+            ):
+                print(f"[FAIL] Telemetry missing mid-run phase/fields: {mid_b}")
+                return False
+            allow_tool_done.set()
+            done_b = await core.check_coding_task(job_id_b, wait_seconds=5)
+            if "status=completed" not in done_b or "tool_calls=1" not in done_b:
+                print(f"[FAIL] Telemetry completed output unexpected: {done_b}")
+                return False
+        finally:
+            provider.Agent = orig_agent_cls  # type: ignore[misc]
+
+        # --- Issue C: Force-abort child process and release slot gate on cancel ---
+        dummy_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stall_started = asyncio.Event()
+
+        class _StallConversation:
+            def __init__(self, proc) -> None:  # noqa: ANN001
+                self.cancel_called = False
+                self._connection = type(
+                    "_Conn", (), {"_process": proc, "_disconnecting": False}
+                )()
+
+            async def send(self, prompt: str) -> None:
+                pass
+
+            async def cancel(self) -> None:
+                self.cancel_called = True
+
+            async def receive_steps(self):
+                yield types.Step(
+                    id="m:0",
+                    step_index=0,
+                    trajectory_id="t2",
+                    source=types.StepSource.MODEL,
+                    target=types.StepTarget.USER,
+                    type=types.StepType.TEXT_RESPONSE,
+                    status=types.StepStatus.ACTIVE,
+                    content_delta="Executing changes now.<channel|>",
+                )
+                stall_started.set()
+                await asyncio.sleep(30)
+
+        stall_conv = _StallConversation(dummy_proc)
+
+        class _StallMockAgent:
+            def __init__(self, config) -> None:  # noqa: ANN001
+                self._conversation = stall_conv
+
+            @property
+            def conversation(self):
+                return self._conversation
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        provider.Agent = _StallMockAgent  # type: ignore[misc]
+        try:
+            start_c = await core.start_coding_task("Stalled task", tmpdir, model="gemma4-32k:latest")
+            job_id_c = start_c.split("job_id=", 1)[1].split(" ", 1)[0]
+            await asyncio.wait_for(stall_started.wait(), timeout=2.0)
+            cancel_c = await core.cancel_coding_task(job_id_c)
+            if "status=cancelled" not in cancel_c:
+                print(f"[FAIL] Expected status=cancelled on cancel: {cancel_c}")
+                return False
+            if not stall_conv.cancel_called or dummy_proc.poll() is None:
+                print("[FAIL] Expected conversation.cancel() and terminated subprocess on cancel.")
+                return False
+            async with asyncio.timeout(1.0):
+                async with core.slot_gate.acquire(workspace_path=tmpdir):
+                    pass
+
+            # --- Issue D: Idle timeout aborts stalled stream & surfaces leaked token ---
+            dummy_proc_d = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stall_started.clear()
+            stall_conv_d = _StallConversation(dummy_proc_d)
+
+            class _StallMockAgentD(_StallMockAgent):
+                def __init__(self, config) -> None:  # noqa: ANN001
+                    self._conversation = stall_conv_d
+
+            provider.Agent = _StallMockAgentD  # type: ignore[misc]
+            timeout_res = await core.delegate_coding_task(
+                spec="Stall test",
+                workspace_path=tmpdir,
+                model="gemma4-32k:latest",
+                idle_timeout_seconds=1,
+            )
+            if (
+                "status=timeout" not in timeout_res
+                or "<channel|>" not in timeout_res
+                or dummy_proc_d.poll() is None
+            ):
+                print(f"[FAIL] Idle timeout did not abort/diagnose properly: {timeout_res}")
+                return False
+        finally:
+            provider.Agent = orig_agent_cls  # type: ignore[misc]
+            if dummy_proc.poll() is None:
+                dummy_proc.kill()
+                dummy_proc.wait(timeout=1.0)
+            if "dummy_proc_d" in locals() and dummy_proc_d.poll() is None:
+                dummy_proc_d.kill()
+                dummy_proc_d.wait(timeout=1.0)
+
+        # --- Issue C (part 2): slow unwinding reports status=cancelling rather than false cancelled ---
+        hold_unwind = asyncio.Event()
+        unwinding_started = asyncio.Event()
+
+        async def _slow_unwind(config, spec, on_chunk=None):  # noqa: ANN001
+            unwinding_started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await hold_unwind.wait()
+                return "cancelled", "cancelled", ""
+            return "completed", "", ""
+
+        core._execute_agent = _slow_unwind  # type: ignore[method-assign]
+        start_slow = await core.start_coding_task("Slow unwind", tmpdir, model="qwen3:8b")
+        job_id_slow = start_slow.split("job_id=", 1)[1].split(" ", 1)[0]
+        await asyncio.wait_for(unwinding_started.wait(), timeout=2.0)
+        cancel_slow = await core.cancel_coding_task(job_id_slow)
+        hold_unwind.set()
+        if "status=cancelling" not in cancel_slow:
+            print(f"[FAIL] Expected status=cancelling while slot unwinds: {cancel_slow}")
+            return False
+        await core.check_coding_task(job_id_slow, wait_seconds=2)
+
+    # --- Issue E: server.py exits cleanly on SIGTERM (with open stdin) and on stdin EOF ---
+    init_req = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "sig-test", "version": "0.1.0"},
+            },
+        }
+    )
+    for mode_name in ("sigterm", "eof"):
+        srv_proc = subprocess.Popen(
+            [sys.executable, str(WORKER_DIR / "server.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert srv_proc.stdin is not None
+            assert srv_proc.stdout is not None
+            srv_proc.stdin.write(init_req + "\n")
+            srv_proc.stdin.flush()
+            init_line = srv_proc.stdout.readline()
+            if not init_line or json.loads(init_line).get("id") != 1:
+                print(f"[FAIL] server.py ({mode_name}) failed initialize handshake: {init_line!r}")
+                return False
+            t0 = time.monotonic()
+            if mode_name == "sigterm":
+                srv_proc.send_signal(signal.SIGTERM)
+            else:
+                srv_proc.stdin.close()
+            rc = srv_proc.wait(timeout=2.0)
+            elapsed_exit = time.monotonic() - t0
+            if rc != 0 or elapsed_exit >= 2.0:
+                print(f"[FAIL] server.py ({mode_name}) exited rc={rc} in {elapsed_exit:.2f}s")
+                return False
+        finally:
+            if srv_proc.poll() is None:
+                srv_proc.kill()
+                srv_proc.wait(timeout=1.0)
+
+    print("[PASS] Worker reliability fixes (Issues A-E) verified.")
+    return True
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test ollama-worker.")
     parser.add_argument(
@@ -643,6 +1048,9 @@ async def main() -> int:
         return 1
 
     if not await verify_async_job_lifecycle():
+        return 1
+
+    if not await verify_worker_reliability_fixes():
         return 1
 
     if args.offline_only:

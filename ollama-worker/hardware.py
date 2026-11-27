@@ -339,7 +339,7 @@ def build_scaling_profile(
         tier = "compact-<=16gb"
         default_parallel = 1
         max_loaded = 1
-        ctx = 32768
+        ctx = 16384
         single_model = "gemma4-32k:latest"
         parallel_model = "qwen3:4b"
     elif effective_memory_gb < 44.0:
@@ -384,6 +384,12 @@ def build_scaling_profile(
             "qwen2.5-coder frequently emits raw JSON text instead of structured OpenAI tool_calls "
             "under LocalOpenAIAgentConfig (causing no-op tool runs); prefer gemma4-32k:latest for "
             "reliable tool calling or qwen3:4b / gemma4:e4b for small parallel slots."
+        )
+
+    if effective_memory_gb <= 18.0 and ctx >= 32768:
+        warnings.append(
+            f"OLLAMA_CONTEXT_LENGTH={ctx} on <=16 GB unified memory increases KV-cache "
+            "memory pressure and latency with 8B+ models; prefer 16384 unless large context is required."
         )
 
     if effective_memory_gb <= 18.0 and max_parallel_workers >= 2:
